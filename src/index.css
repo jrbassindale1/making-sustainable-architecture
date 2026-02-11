@@ -1,0 +1,39 @@
+@import url("https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --font-body: "Space Grotesk", "Segoe UI", "Noto Sans", sans-serif;
+    --font-display: "Cormorant Garamond", "Iowan Old Style", "Times New Roman", serif;
+  }
+
+  body {
+    font-family: var(--font-body);
+    letter-spacing: -0.01em;
+    @apply min-h-screen bg-slate-50 text-slate-900 antialiased;
+  }
+
+  #root {
+    @apply min-h-screen;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.01em;
+  }
+
+  .info-popover-host {
+    position: relative;
+    z-index: 0;
+  }
+
+  .info-popover-host:has(details[data-info-popover][open]) {
+    z-index: 50;
+  }
+}
