@@ -203,3 +203,4 @@ Primary references used to frame assumptions and method:
    https://www.gov.uk/government/publications/greenhouse-gas-reporting-conversion-factors-2025
 
 These references inform method selection; this simulator is still a simplified implementation and not a full standards-compliance engine.
+
