@@ -219,6 +219,40 @@ export function classifyIlluminance(lux) {
   return { level: "very_bright", label: "Very bright", description: "May need shading" };
 }
 
+/* -------------------- Ventilation opening area -------------------- */
+// Constants for natural ventilation calculation
+const DISCHARGE_COEFFICIENT = 0.6; // Typical for window openings
+const CROSS_VENT_VELOCITY = 1.0; // m/s - effective velocity for cross-ventilation
+
+/**
+ * Calculate the required free opening area to achieve a given ACH
+ * Uses simplified natural ventilation formula: Q = Cd × A × v
+ *
+ * @param {number} achTotal - Target air changes per hour
+ * @param {number} volume - Room volume [m³]
+ * @returns {object} Opening area info with area in m² and formatted examples
+ */
+export function calculateOpeningArea(achTotal, volume) {
+  // Q = ACH × Volume / 3600 (convert to m³/s)
+  const flowRate = (achTotal * volume) / 3600;
+
+  // A = Q / (Cd × v_eff)
+  const openingAreaM2 = flowRate / (DISCHARGE_COEFFICIENT * CROSS_VENT_VELOCITY);
+
+  // Calculate equivalent square sash dimensions (mm)
+  const sashSideMm = Math.round(Math.sqrt(openingAreaM2) * 1000);
+
+  // Calculate percentage opening for a standard 600×600mm casement
+  const casementArea = 0.36; // 600mm × 600mm = 0.36 m²
+  const casementPercent = Math.round((openingAreaM2 / casementArea) * 100);
+
+  return {
+    areaM2: openingAreaM2,
+    sashSideMm,
+    casementPercent: Math.min(100, casementPercent),
+  };
+}
+
 /* -------------------- Helpers -------------------- */
 export const deg2rad = (d) => (d * Math.PI) / 180;
 export const rad2deg = (r) => (r * 180) / Math.PI;

@@ -47,6 +47,7 @@ import {
   WEATHER_FILE_URL,
   LUX_THRESHOLDS,
   buildPreviewFaceConfigs,
+  calculateOpeningArea,
   classifyIlluminance,
   buildWindowsFromFaceState,
   cardinalFromAzimuth,
@@ -119,8 +120,6 @@ export default function App() {
   const [optionA, setOptionA] = useState(null);
   const [optionB, setOptionB] = useState(null);
   const [showCompare, setShowCompare] = useState(false);
-  const [balancedOutEnabled, setBalancedOutEnabled] = useState(true);
-  const [balancedOutDays, setBalancedOutDays] = useState(SIMULATION_SPINUP_DAYS);
   const [exportingVideo, setExportingVideo] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportingPdf, setExportingPdf] = useState(false);
@@ -305,10 +304,7 @@ export default function App() {
       }),
     [selectedDate],
   );
-  const effectiveSpinupDays = useMemo(
-    () => (balancedOutEnabled ? Math.max(0, Math.round(balancedOutDays)) : 0),
-    [balancedOutEnabled, balancedOutDays],
-  );
+  const effectiveSpinupDays = SIMULATION_SPINUP_DAYS;
 
   const windows = useMemo(
     () => buildWindowsFromFaceState(faceState, orientationDeg),
@@ -547,9 +543,7 @@ export default function App() {
       uValuePreset,
       ventilationPreset,
       nightPurgeEnabled,
-      balancedOutEnabled,
-      balancedOutDays,
-      effectiveSpinupDays,
+      spinupDays: effectiveSpinupDays,
     },
     derived: {
       activeUValues,
@@ -1130,12 +1124,24 @@ export default function App() {
                           compact
                           tight
                           className="min-h-0"
-                          info={
-                            <p>
-                              Fresh air rate is the total air changes per hour (ACH) from the chosen
-                              preset, including background infiltration.
-                            </p>
-                          }
+                          info={(() => {
+                            const volume = BUILDING_WIDTH * BUILDING_DEPTH * BUILDING_HEIGHT;
+                            const opening = calculateOpeningArea(achTotalAtTime, volume);
+                            return (
+                              <>
+                                <p>
+                                  Fresh air rate is the total air changes per hour (ACH) from the chosen
+                                  preset, including background infiltration.
+                                </p>
+                                <p className="mt-2 text-xs text-slate-600">
+                                  For {achTotalAtTime.toFixed(1)} ACH with cross-ventilation, you would need
+                                  roughly <strong>{opening.areaM2.toFixed(2)} m²</strong> of free opening area —
+                                  equivalent to a window sash {opening.sashSideMm}mm × {opening.sashSideMm}mm fully
+                                  open, or a 600mm × 600mm casement opened to ~{opening.casementPercent}%.
+                                </p>
+                              </>
+                            );
+                          })()}
                         />
                         <IlluminanceCard
                           illuminance={snapshot.illuminanceLux}
@@ -1736,37 +1742,15 @@ export default function App() {
 
                     {exploreTab === "general" && (
                       <div className="space-y-2">
-                        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3">
-                          <div>
-                            <p className="text-sm font-medium text-slate-800">Warm-up period</p>
-                            <p className="text-xs text-slate-500">
-                              Simulate previous days so the room starts at a realistic temperature.
-                            </p>
-                          </div>
-                          <Switch checked={balancedOutEnabled} onCheckedChange={setBalancedOutEnabled} />
-                        </div>
-                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
-                          <SliderField
-                            label="Warm-up days"
-                            value={balancedOutDays}
-                            onChange={(value) => setBalancedOutDays(Math.round(value))}
-                            min={0}
-                            max={20}
-                            step={1}
-                            disabled={!balancedOutEnabled}
-                            formatValue={(v) => `${Math.round(v)} days`}
-                          />
-                          <p className="text-xs text-slate-500">
-                            {balancedOutEnabled && balancedOutDays > 0 ? (
-                              <>Simulates {Math.round(balancedOutDays)} day(s) before your selected date, so the room's thermal mass (walls, floor, furniture) has time to absorb or release heat realistically.</>
-                            ) : (
-                              <>Without warm-up, the room starts at outdoor temperature at midnight — as if the building appeared from nowhere. This underestimates how warm (or cool) the room would actually be.</>
-                            )}
+                        <div className="rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-sm font-medium text-slate-800">Warm-up period</p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            The simulation runs for {SIMULATION_SPINUP_DAYS} days before your selected date so the room's thermal mass (walls, floor, furniture) reaches a realistic starting temperature.
                           </p>
-                          <details className="text-xs text-slate-500">
-                            <summary className="cursor-pointer font-medium text-slate-600 hover:text-slate-800">Why does this matter?</summary>
+                          <details className="mt-2 text-xs text-slate-500">
+                            <summary className="cursor-pointer font-medium text-slate-600 hover:text-slate-800">Why is this needed?</summary>
                             <p className="mt-2 rounded bg-slate-50 p-2">
-                              A real room doesn't start cold each morning — it carries heat from previous days. Heavy materials like concrete store heat and release it slowly. With high glazing and low ventilation, a room can accumulate heat over several days like a greenhouse. Try 7+ days to see the realistic steady-state temperature.
+                              A real room doesn't start cold each morning — it carries heat from previous days. Heavy materials like concrete store heat and release it slowly. Without warm-up, the simulation would start at outdoor temperature at midnight, as if the building appeared from nowhere.
                             </p>
                           </details>
                         </div>
