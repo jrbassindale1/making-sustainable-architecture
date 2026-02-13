@@ -437,12 +437,6 @@ export default function App() {
   const formatDateStamp = (date) => date.toISOString().slice(0, 10);
   const formatExportStamp = () =>
     new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-  const escapeCsvValue = (value) => {
-    const str = value === null || value === undefined ? "" : String(value);
-    return /[",\n]/.test(str) ? `"${str.replace(/"/g, "\"\"")}"` : str;
-  };
-  const formatNumber = (value, digits = 3) =>
-    Number.isFinite(value) ? Number(value).toFixed(digits) : "";
   const downloadFile = (filename, content, type = "application/octet-stream") => {
     const blob = content instanceof Blob ? content : new Blob([content], { type });
     const url = URL.createObjectURL(blob);
@@ -463,121 +457,6 @@ export default function App() {
     });
 
   const getSettingsCaptureTarget = () => settingsCaptureRef.current;
-
-  const buildSettingsExport = () => ({
-    generatedAt: new Date().toISOString(),
-    app: "room-comfort-sim",
-    weather: {
-      mode: weatherMode,
-      effectiveMode: effectiveWeatherMode,
-      usingEpw,
-      warning: weatherWarning || null,
-      summary: weatherSummary,
-      description: weatherDescription,
-      location: weatherMeta,
-    },
-    selectedDate: {
-      dayOfYear,
-      dateUTC: selectedDate.toISOString().slice(0, 10),
-      timeFraction: timeFrac,
-      timeUTC: dateAtTime.toISOString(),
-      timeLabel,
-    },
-    inputs: {
-      orientationDeg,
-      faceState,
-      overallWWR,
-      uValuePreset,
-      ventilationPreset,
-      nightPurgeEnabled,
-      spinupDays: effectiveSpinupDays,
-    },
-    derived: {
-      activeUValues,
-      ventilationAchTotal,
-      adaptiveVentEnabled,
-    },
-    dailySummary: daySummary,
-    dailyCostSummary: dayCostSummary,
-    annualCostSummary,
-  });
-
-  const exportSettingsJson = () => {
-    const payload = buildSettingsExport();
-    downloadFile(
-      `room-comfort-settings-${formatDateStamp(selectedDate)}-${formatExportStamp()}.json`,
-      `${JSON.stringify(payload, null, 2)}\n`,
-      "application/json",
-    );
-  };
-
-  const buildDayCsv = () => {
-    const header = [
-      "index",
-      "time_utc",
-      "time_label",
-      "T_in_C",
-      "T_out_C",
-      "Q_solar_W",
-      "Q_loss_fabric_W",
-      "Q_loss_vent_W",
-      "status",
-      "heating_W",
-      "cooling_W",
-      "ach_total",
-      "vent_active",
-      "illuminance_lux",
-      "wind_ms",
-    ];
-    const rows = daySeries.map((point, idx) => [
-      idx,
-      point.time?.toISOString?.() ?? "",
-      point.timeLabel ?? "",
-      formatNumber(point.T_in, 2),
-      formatNumber(point.T_out, 2),
-      formatNumber(point.Q_solar, 2),
-      formatNumber(point.Q_loss_fabric, 2),
-      formatNumber(point.Q_loss_vent, 2),
-      point.status ?? "",
-      formatNumber(point.heatingW, 2),
-      formatNumber(point.coolingW, 2),
-      formatNumber(point.achTotal, 3),
-      point.ventActive ? 1 : 0,
-      formatNumber(point.illuminanceLux, 1),
-      formatNumber(point.windMS, 2),
-    ]);
-    return [header, ...rows].map((row) => row.map(escapeCsvValue).join(",")).join("\n");
-  };
-
-  const exportDayCsv = () => {
-    if (daySeries.length === 0) return;
-    const csv = buildDayCsv();
-    downloadFile(
-      `room-comfort-day-${formatDateStamp(selectedDate)}-${formatExportStamp()}.csv`,
-      `${csv}\n`,
-      "text/csv",
-    );
-  };
-
-  const exportAnnualJson = () => {
-    if (!annualCurrent) return;
-    const payload = {
-      generatedAt: new Date().toISOString(),
-      metrics: {
-        ...annualCurrent.metrics,
-        peakTime: annualCurrent.metrics.peakTime?.toISOString?.() ?? null,
-      },
-      histogram: annualCurrent.histogram,
-      monthlyData: annualCurrent.monthlyData,
-      worstWeek: annualCurrent.worstWeek,
-      winterWeek: annualCurrent.winterWeek,
-    };
-    downloadFile(
-      `room-comfort-annual-${formatDateStamp(selectedDate)}-${formatExportStamp()}.json`,
-      `${JSON.stringify(payload, null, 2)}\n`,
-      "application/json",
-    );
-  };
 
   const exportSettingsPdf = async () => {
     if (exportingPdf) return;
@@ -1879,24 +1758,6 @@ export default function App() {
 
                     {exploreTab === "export" && (
                       <div className="space-y-3">
-                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
-                          <p className="text-sm font-medium text-slate-800">Data exports</p>
-                          <p className="text-xs text-slate-500">
-                            Exports the current inputs and the latest simulation outputs.
-                          </p>
-                          <div className="grid gap-2">
-                            <Button size="sm" variant="secondary" onClick={exportSettingsJson}>
-                              Export settings (JSON)
-                            </Button>
-                            <Button size="sm" variant="secondary" onClick={exportDayCsv}>
-                              Export day series (CSV)
-                            </Button>
-                            <Button size="sm" variant="secondary" onClick={exportAnnualJson}>
-                              Export annual summary (JSON)
-                            </Button>
-                          </div>
-                        </div>
-
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-sm font-medium text-slate-800">PDF snapshot</p>
                           <p className="text-xs text-slate-500">
