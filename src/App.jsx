@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   LineChart,
   Line,
@@ -115,10 +116,12 @@ export default function App() {
   const [showCompare, setShowCompare] = useState(false);
   const [exportingVideo, setExportingVideo] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
-  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportingPngs, setExportingPngs] = useState(false);
   const [exportError, setExportError] = useState("");
   const mainCaptureRef = useRef(null);
-  const settingsCaptureRef = useRef(null);
+  const moreDetailsRef = useRef(null);
+  const dailyChartContainerRef = useRef(null);
+  const [dailyChartSize, setDailyChartSize] = useState({ width: 0, height: 0 });
 
   const faceFacingLabel = (face) => {
     const azimuth = normalizedAzimuth(face.azimuth + orientationDeg);
@@ -153,6 +156,26 @@ export default function App() {
     return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencilli - Brecon.";
   }, []);
 
+  useEffect(() => {
+    const node = dailyChartContainerRef.current;
+    if (!node) return;
+
+    const updateSize = () => {
+      const rect = node.getBoundingClientRect();
+      setDailyChartSize({
+        width: Math.max(0, Math.floor(rect.width)),
+        height: Math.max(0, Math.floor(rect.height)),
+      });
+    };
+
+    updateSize();
+
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => updateSize());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
   const activeUPreset = useMemo(
     () => U_VALUE_PRESETS[uValuePreset] ?? U_VALUE_PRESETS[DEFAULT_U_VALUE_PRESET],
     [uValuePreset],
@@ -172,6 +195,17 @@ export default function App() {
     () =>
       selectedDate.toLocaleDateString([], {
         month: "short",
+        day: "numeric",
+        timeZone: "UTC",
+      }),
+    [selectedDate],
+  );
+  const selectedDayDateLabel = useMemo(
+    () =>
+      selectedDate.toLocaleDateString([], {
+        weekday: "long",
+        year: "numeric",
+        month: "long",
         day: "numeric",
         timeZone: "UTC",
       }),
@@ -363,6 +397,7 @@ export default function App() {
   const formatDateStamp = (date) => date.toISOString().slice(0, 10);
   const formatExportStamp = () =>
     new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const A4_EXPORT_SIZE = { width: 2480, height: 3508 };
   const downloadFile = (filename, content, type = "application/octet-stream") => {
     const blob = content instanceof Blob ? content : new Blob([content], { type });
     const url = URL.createObjectURL(blob);
@@ -382,39 +417,284 @@ export default function App() {
       });
     });
 
-  const getSettingsCaptureTarget = () => settingsCaptureRef.current;
+  const renderCanvasToA4 = (sourceCanvas) => {
+    const output = document.createElement("canvas");
+    output.width = A4_EXPORT_SIZE.width;
+    output.height = A4_EXPORT_SIZE.height;
+    const ctx = output.getContext("2d");
+    if (!ctx) return null;
 
-  const exportSettingsPdf = async () => {
-    if (exportingPdf) return;
-    const target = getSettingsCaptureTarget();
-    if (!target) return;
-    setExportingPdf(true);
+    const margin = 130;
+    const drawWidthMax = output.width - margin * 2;
+    const drawHeightMax = output.height - margin * 2;
+    const scale = Math.min(drawWidthMax / sourceCanvas.width, drawHeightMax / sourceCanvas.height);
+    const drawWidth = sourceCanvas.width * scale;
+    const drawHeight = sourceCanvas.height * scale;
+    const drawX = (output.width - drawWidth) / 2;
+    const drawY = margin;
+
+    ctx.fillStyle = "#f5f3ee";
+    ctx.fillRect(0, 0, output.width, output.height);
+    ctx.drawImage(sourceCanvas, drawX, drawY, drawWidth, drawHeight);
+    return output;
+  };
+
+  const downloadCanvasPng = (filename, canvas) =>
+    new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error("Unable to create PNG blob."));
+          return;
+        }
+        downloadFile(filename, blob, "image/png");
+        resolve();
+      }, "image/png");
+    });
+
+  const exportSnapshotPngs = async () => {
+    if (exportingPngs) return;
+    const frontTarget = mainCaptureRef.current;
+    if (!frontTarget) return;
+    const infoPopoverNodes = Array.from(frontTarget.querySelectorAll("details[data-info-popover]"));
+    const previouslyOpenInfoPopovers = infoPopoverNodes.filter((node) => node.open);
+    infoPopoverNodes.forEach((node) => {
+      node.open = false;
+    });
+
+    const moreDetailsNode = moreDetailsRef.current;
+    const wasMoreDetailsOpen = Boolean(moreDetailsNode?.open);
+    if (moreDetailsNode) {
+      moreDetailsNode.open = true;
+    }
+
+    const glazingSummary = [
+      `Total window-to-wall ratio: ${Math.round(overallWWR * 100)}%`,
+      `North (${faceFacingLabel(FACES.find((f) => f.id === "north"))}): ${Math.round(faceState.north.glazing * 100)}%`,
+      `East (${faceFacingLabel(FACES.find((f) => f.id === "east"))}): ${Math.round(faceState.east.glazing * 100)}%`,
+      `South (${faceFacingLabel(FACES.find((f) => f.id === "south"))}): ${Math.round(faceState.south.glazing * 100)}%`,
+      `West (${faceFacingLabel(FACES.find((f) => f.id === "west"))}): ${Math.round(faceState.west.glazing * 100)}%`,
+    ].join("\n");
+    const shadingSummary = [
+      `North: overhang ${faceState.north.overhang.toFixed(2)}, vertical fins ${faceState.north.fin.toFixed(2)}, horizontal fins ${faceState.north.hFin.toFixed(2)}`,
+      `East: overhang ${faceState.east.overhang.toFixed(2)}, vertical fins ${faceState.east.fin.toFixed(2)}, horizontal fins ${faceState.east.hFin.toFixed(2)}`,
+      `South: overhang ${faceState.south.overhang.toFixed(2)}, vertical fins ${faceState.south.fin.toFixed(2)}, horizontal fins ${faceState.south.hFin.toFixed(2)}`,
+      `West: overhang ${faceState.west.overhang.toFixed(2)}, vertical fins ${faceState.west.fin.toFixed(2)}, horizontal fins ${faceState.west.hFin.toFixed(2)}`,
+    ].join("\n");
+    const fabricSummary = [
+      `Preset: ${activeUPreset.label}`,
+      `${activeUPreset.detail}`,
+      `U-values (W/m2K):`,
+      `Walls ${activeUValues.wall.toFixed(2)} | Roof ${activeUValues.roof.toFixed(2)}`,
+      `Floor ${activeUValues.floor.toFixed(2)} | Windows ${activeUValues.window.toFixed(2)}`,
+    ].join("\n");
+    const ventilationSummaryCompact = [
+      `Preset: ${activeVentPreset.label}`,
+      `${activeVentPreset.detail}`,
+      `Current rate: ${ventilationAchTotal.toFixed(1)} air changes per hour`,
+      `Adaptive mode: ${adaptiveVentEnabled ? "On" : "Off"}`,
+      `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : nightPurgeEnabled ? "On" : "Off"}`,
+    ].join("\n");
+
+    const chartNode = dailyChartContainerRef.current;
+    if (chartNode) {
+      const rect = chartNode.getBoundingClientRect();
+      flushSync(() => {
+        setDailyChartSize({
+          width: Math.max(0, Math.floor(rect.width)),
+          height: Math.max(0, Math.floor(rect.height)),
+        });
+      });
+    }
+
+    setExportingPngs(true);
     setExportError("");
+    let frontExportHost = null;
     try {
-      const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
-        import("html2canvas"),
-        import("jspdf"),
-      ]);
+      const { default: html2canvas } = await import("html2canvas");
+      // Let layout settle after opening "More details" and updating fixed chart size.
       await waitForNextFrame();
-      const canvas = await html2canvas(target, {
+      await waitForNextFrame();
+      const frontClone = frontTarget.cloneNode(true);
+      frontExportHost = document.createElement("div");
+      frontExportHost.style.position = "fixed";
+      frontExportHost.style.left = "-10000px";
+      frontExportHost.style.top = "0";
+      frontExportHost.style.width = `${frontTarget.clientWidth}px`;
+      frontExportHost.style.background = "#f5f3ee";
+      frontExportHost.style.zIndex = "-1";
+      frontClone.style.height = "auto";
+      frontClone.style.maxHeight = "none";
+      frontClone.style.minHeight = "0";
+      frontClone.style.overflow = "visible";
+      const frontHeader = document.createElement("div");
+      frontHeader.style.marginBottom = "16px";
+      frontHeader.style.padding = "10px 12px";
+      frontHeader.style.border = "1px solid #cbd5e1";
+      frontHeader.style.borderRadius = "8px";
+      frontHeader.style.background = "#ffffff";
+      frontHeader.style.fontFamily = "Space Grotesk, Segoe UI, sans-serif";
+      frontHeader.style.fontSize = "16px";
+      frontHeader.style.fontWeight = "700";
+      frontHeader.style.color = "#334155";
+      frontHeader.textContent = `Location: ${weatherSummary} | Date: ${selectedDayDateLabel} | Time: ${selectedHourRangeLabel}`;
+      frontClone.prepend(frontHeader);
+      frontExportHost.appendChild(frontClone);
+      document.body.appendChild(frontExportHost);
+
+      frontClone.querySelectorAll("details[data-info-popover]").forEach((node) => {
+        node.removeAttribute("open");
+        node.style.display = "none";
+      });
+      const cloneMoreDetails = frontClone.querySelector("details[data-export-more-details]");
+      if (cloneMoreDetails) {
+        cloneMoreDetails.open = true;
+        cloneMoreDetails.setAttribute("open", "");
+      }
+
+      const frontSummaryGrid = document.createElement("div");
+      frontSummaryGrid.style.marginTop = "10px";
+      frontSummaryGrid.style.display = "grid";
+      frontSummaryGrid.style.gridTemplateColumns = "1fr 1fr";
+      frontSummaryGrid.style.gap = "8px";
+      frontSummaryGrid.style.fontFamily = "Space Grotesk, Segoe UI, sans-serif";
+      const frontSummaryTitle = document.createElement("p");
+      frontSummaryTitle.textContent = "Environemntal Settings";
+      frontSummaryTitle.style.margin = "10px 0 0 0";
+      frontSummaryTitle.style.fontSize = "12px";
+      frontSummaryTitle.style.fontWeight = "700";
+      frontSummaryTitle.style.textTransform = "uppercase";
+      frontSummaryTitle.style.letterSpacing = "0.04em";
+      frontSummaryTitle.style.color = "#64748b";
+
+      const createSummaryCell = (title, body) => {
+        const cell = document.createElement("div");
+        cell.style.border = "1px solid #cbd5e1";
+        cell.style.borderRadius = "8px";
+        cell.style.background = "#ffffff";
+        cell.style.padding = "8px 10px";
+
+        const h = document.createElement("p");
+        h.style.margin = "0 0 4px 0";
+        h.style.fontSize = "11px";
+        h.style.fontWeight = "700";
+        h.style.textTransform = "uppercase";
+        h.style.letterSpacing = "0.04em";
+        h.style.color = "#475569";
+        h.textContent = title;
+
+        const b = document.createElement("p");
+        b.style.margin = "0";
+        b.style.fontSize = "14px";
+        b.style.lineHeight = "1.375";
+        b.style.whiteSpace = "pre-line";
+        b.style.color = "#475569";
+        b.textContent = body;
+
+        cell.appendChild(h);
+        cell.appendChild(b);
+        return cell;
+      };
+
+      frontSummaryGrid.appendChild(createSummaryCell("Glazing", glazingSummary));
+      frontSummaryGrid.appendChild(createSummaryCell("Shading", shadingSummary));
+      frontSummaryGrid.appendChild(createSummaryCell("Fabric", fabricSummary));
+      frontSummaryGrid.appendChild(createSummaryCell("Ventilation", ventilationSummaryCompact));
+      if (cloneMoreDetails) {
+        cloneMoreDetails.insertAdjacentElement("afterend", frontSummaryTitle);
+        frontSummaryTitle.insertAdjacentElement("afterend", frontSummaryGrid);
+      } else {
+        frontClone.appendChild(frontSummaryTitle);
+        frontClone.appendChild(frontSummaryGrid);
+      }
+
+      const sourceChartNode = dailyChartContainerRef.current;
+      const cloneChartNode = frontClone.querySelector("[data-export-temp-chart]");
+      if (sourceChartNode && cloneChartNode) {
+        const chartCanvas = await html2canvas(sourceChartNode, {
+          backgroundColor: "#ffffff",
+          scale: 2,
+          useCORS: true,
+          logging: false,
+        });
+        const chartImg = document.createElement("img");
+        chartImg.src = chartCanvas.toDataURL("image/png");
+        chartImg.style.width = "100%";
+        chartImg.style.height = "100%";
+        chartImg.style.display = "block";
+        chartImg.style.objectFit = "contain";
+        cloneChartNode.innerHTML = "";
+        cloneChartNode.style.overflow = "hidden";
+        cloneChartNode.appendChild(chartImg);
+        await new Promise((resolve) => {
+          chartImg.onload = resolve;
+          chartImg.onerror = resolve;
+        });
+      }
+
+      const sourceModelNode = frontTarget.querySelector("[data-export-model-panel]");
+      const cloneModelNode = frontClone.querySelector("[data-export-model-panel]");
+      if (sourceModelNode && cloneModelNode) {
+        const modelCanvas = await html2canvas(sourceModelNode, {
+          backgroundColor: "#f5f3ee",
+          scale: 2,
+          useCORS: true,
+          logging: false,
+        });
+        const modelImg = document.createElement("img");
+        modelImg.src = modelCanvas.toDataURL("image/png");
+        modelImg.style.width = "100%";
+        modelImg.style.height = "100%";
+        modelImg.style.display = "block";
+        modelImg.style.objectFit = "contain";
+        cloneModelNode.innerHTML = "";
+        cloneModelNode.style.overflow = "hidden";
+        cloneModelNode.appendChild(modelImg);
+        await new Promise((resolve) => {
+          modelImg.onload = resolve;
+          modelImg.onerror = resolve;
+        });
+      }
+
+      await waitForNextFrame();
+      const frontCaptureWidth = Math.max(frontClone.scrollWidth, frontClone.clientWidth);
+      const frontCaptureHeight = Math.max(frontClone.scrollHeight, frontClone.clientHeight);
+      const frontCanvas = await html2canvas(frontClone, {
         backgroundColor: "#f5f3ee",
         scale: 2,
         useCORS: true,
         logging: false,
+        width: frontCaptureWidth,
+        height: frontCaptureHeight,
+        windowWidth: frontCaptureWidth,
+        windowHeight: frontCaptureHeight,
+        scrollX: 0,
+        scrollY: 0,
       });
-      const isLandscape = canvas.width >= canvas.height;
-      const pdf = new jsPDF({
-        orientation: isLandscape ? "landscape" : "portrait",
-        unit: "px",
-        format: [canvas.width, canvas.height],
-      });
-      pdf.addImage(canvas, "PNG", 0, 0, canvas.width, canvas.height);
-      pdf.save(`room-comfort-settings-${formatDateStamp(selectedDate)}-${formatExportStamp()}.pdf`);
+      const frontA4Canvas = renderCanvasToA4(frontCanvas);
+      if (!frontA4Canvas) {
+        throw new Error("Canvas context unavailable.");
+      }
+
+      const dateStamp = formatDateStamp(selectedDate);
+      const exportStamp = formatExportStamp();
+      await downloadCanvasPng(
+        `room-comfort-frontpage-${dateStamp}-${exportStamp}.png`,
+        frontA4Canvas,
+      );
     } catch (error) {
-      console.error("[Export] PDF failed:", error);
-      setExportError("PDF export failed. Please try again.");
+      console.error("[Export] PNG snapshots failed:", error);
+      setExportError("PNG export failed. Please try again.");
     } finally {
-      setExportingPdf(false);
+      if (frontExportHost?.parentNode) {
+        frontExportHost.parentNode.removeChild(frontExportHost);
+      }
+      if (moreDetailsNode && !wasMoreDetailsOpen) {
+        moreDetailsNode.open = false;
+      }
+      previouslyOpenInfoPopovers.forEach((node) => {
+        node.open = true;
+      });
+      setExportingPngs(false);
     }
   };
 
@@ -769,12 +1049,13 @@ export default function App() {
         <div className="grid flex-1 min-h-0 gap-4 lg:grid-cols-[minmax(0,1.65fr)_400px]">
           <div
             ref={mainCaptureRef}
+            data-export-main-capture
             className="flex min-h-0 flex-col gap-4 lg:overflow-y-auto lg:pr-2"
           >
             {viewMode === "explore" && (
               <>
                 <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.5fr)] lg:items-stretch">
-                  <div className="flex h-full min-h-0 flex-col gap-4">
+                  <div data-export-model-panel className="flex h-full min-h-0 flex-col gap-4">
                     <BuildingPreview
                       faceConfigs={previewFaceConfigs}
                       snapshot={snapshot}
@@ -928,7 +1209,10 @@ export default function App() {
                     </div>
                   </div>
 
-                  <Card className="relative z-0 info-popover-host flex flex-col gap-3 p-4 lg:col-span-2">
+                  <Card
+                    data-export-temp-chart-card
+                    className="relative z-0 info-popover-host flex min-w-0 flex-col gap-3 p-4 lg:col-span-2"
+                  >
                     <InfoPopover className="right-3 top-3">
                       <p>
                         Green line = indoor temperature. Blue dashed = outdoor temperature. Yellow
@@ -948,10 +1232,18 @@ export default function App() {
                       <p className="text-sm font-semibold text-slate-700">{selectedHourRangeLabel}</p>
                       <div className="flex-1"></div>
                     </div>
-                    <div className="h-44 md:h-52">
+                    <div
+                      ref={dailyChartContainerRef}
+                      data-export-temp-chart
+                      className="h-44 min-w-0 md:h-52"
+                    >
                       {chartData.length > 0 ? (
-                        <ResponsiveContainer width="100%" height="100%">
-                          <LineChart data={chartData}>
+                        dailyChartSize.width > 0 && dailyChartSize.height > 0 && (
+                          <LineChart
+                            width={dailyChartSize.width}
+                            height={dailyChartSize.height}
+                            data={chartData}
+                          >
                             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                             {Number.isFinite(selectedHour) && (
                               <ReferenceArea
@@ -1037,7 +1329,7 @@ export default function App() {
                               name="Heat loss"
                             />
                           </LineChart>
-                        </ResponsiveContainer>
+                        )
                       ) : (
                         <div className="flex h-full items-center justify-center rounded-lg bg-slate-50 text-sm text-slate-500">
                           Move the sliders to explore how temperature changes through the day.
@@ -1047,7 +1339,11 @@ export default function App() {
                   </Card>
                 </div>
 
-                <details className="rounded-lg border border-slate-200 bg-white p-4">
+                <details
+                  ref={moreDetailsRef}
+                  data-export-more-details
+                  className="rounded-lg border border-slate-200 bg-white p-4"
+                >
                   <summary className="cursor-pointer text-sm font-semibold text-slate-700">
                     More details
                   </summary>
@@ -1356,10 +1652,7 @@ export default function App() {
               </>
             )}
           </div>
-          <div
-            ref={settingsCaptureRef}
-            className="flex min-h-0 flex-col gap-4 lg:w-[400px] lg:max-w-[400px] lg:overflow-hidden"
-          >
+          <div className="flex min-h-0 flex-col gap-4 lg:w-[400px] lg:max-w-[400px] lg:overflow-hidden">
             <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1 lg:pr-2">
               {viewMode === "explore" && (
                 <>
@@ -1673,17 +1966,17 @@ export default function App() {
                     {exploreTab === "export" && (
                       <div className="space-y-3">
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
-                          <p className="text-sm font-medium text-slate-800">PDF snapshot</p>
+                          <p className="text-sm font-medium text-slate-800">PNG snapshot</p>
                           <p className="text-xs text-slate-500">
-                            Captures the settings panel exactly as shown.
+                            Exports a single A4 front page with model, chart, details, and environmental settings.
                           </p>
                           <Button
                             size="sm"
                             variant="secondary"
-                            onClick={exportSettingsPdf}
-                            disabled={exportingPdf}
+                            onClick={exportSnapshotPngs}
+                            disabled={exportingPngs}
                           >
-                            {exportingPdf ? "Exporting PDF..." : "Export PDF snapshot"}
+                            {exportingPngs ? "Exporting PNG..." : "Export PNG snapshot"}
                           </Button>
                         </div>
 
@@ -1771,6 +2064,7 @@ export default function App() {
             </div>
           </div>
         </div>
+
       </main>
     </div>
   );
