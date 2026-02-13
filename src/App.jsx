@@ -47,10 +47,8 @@ import {
   LUX_THRESHOLDS,
   buildPreviewFaceConfigs,
   calculateOpeningArea,
-  classifyIlluminance,
   buildWindowsFromFaceState,
   cardinalFromAzimuth,
-  cloneFaceState,
   computeCostCarbonSummary,
   computeSnapshot,
   dateFromDayOfYearUTC,
@@ -64,8 +62,6 @@ import {
   normalizedAzimuth,
   simulateAnnual1R1C,
   simulateDay1R1C,
-  uValuePresetLabel,
-  ventilationPresetLabel,
   WINTER_SOLSTICE_DAY,
   SPRING_EQUINOX_DAY,
   AUTUMN_EQUINOX_DAY,
@@ -111,9 +107,6 @@ export default function App() {
   const [uValuePreset, setUValuePreset] = useState(DEFAULT_U_VALUE_PRESET);
   const [dayOfYear, setDayOfYear] = useState(initialSolsticeDay);
   const [timeFrac, setTimeFrac] = useState(MIDDAY_TIME_FRAC);
-  const [optionA, setOptionA] = useState(null);
-  const [optionB, setOptionB] = useState(null);
-  const [showCompare, setShowCompare] = useState(false);
   const [exportingVideo, setExportingVideo] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportingPngs, setExportingPngs] = useState(false);
@@ -840,17 +833,6 @@ export default function App() {
     }
   };
 
-  const currentDesign = useMemo(
-    () => ({
-      faceState: cloneFaceState(faceState),
-      orientationDeg,
-      ventilationPreset,
-      nightPurgeEnabled,
-      uValuePreset,
-    }),
-    [faceState, orientationDeg, ventilationPreset, nightPurgeEnabled, uValuePreset],
-  );
-
   const annualCurrent = useMemo(
     () =>
       simulateAnnual1R1C(baseParams, weatherProvider, {
@@ -872,70 +854,6 @@ export default function App() {
       days: DAYS_PER_YEAR,
     });
   }, [annualCurrent]);
-
-  const annualA = useMemo(() => {
-    if (!optionA) return null;
-    const presetA = U_VALUE_PRESETS[optionA.uValuePreset] ?? U_VALUE_PRESETS[DEFAULT_U_VALUE_PRESET];
-    const ventPresetA =
-      VENTILATION_PRESETS[optionA.ventilationPreset] ??
-      VENTILATION_PRESETS[DEFAULT_VENTILATION_PRESET];
-    const paramsA = {
-      ...baseParamsTemplate,
-      U_wall: presetA.values.wall,
-      U_window: presetA.values.window,
-      U_roof: presetA.values.roof,
-      U_floor: presetA.values.floor,
-      windows: buildWindowsFromFaceState(optionA.faceState, optionA.orientationDeg),
-    };
-    return simulateAnnual1R1C(paramsA, weatherProvider, {
-      comfortBand: COMFORT_BAND,
-      thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
-      achTotal: ventPresetA.achTotal,
-      nightPurgeEnabled: optionA.nightPurgeEnabled ?? false,
-      adaptiveVentEnabled: ventPresetA.isAdaptive === true,
-      spinupHours: effectiveSpinupDays * 24,
-    });
-  }, [optionA, baseParamsTemplate, weatherProvider, effectiveSpinupDays]);
-
-  const annualB = useMemo(() => {
-    if (!optionB) return null;
-    const presetB = U_VALUE_PRESETS[optionB.uValuePreset] ?? U_VALUE_PRESETS[DEFAULT_U_VALUE_PRESET];
-    const ventPresetB =
-      VENTILATION_PRESETS[optionB.ventilationPreset] ??
-      VENTILATION_PRESETS[DEFAULT_VENTILATION_PRESET];
-    const paramsB = {
-      ...baseParamsTemplate,
-      U_wall: presetB.values.wall,
-      U_window: presetB.values.window,
-      U_roof: presetB.values.roof,
-      U_floor: presetB.values.floor,
-      windows: buildWindowsFromFaceState(optionB.faceState, optionB.orientationDeg),
-    };
-    return simulateAnnual1R1C(paramsB, weatherProvider, {
-      comfortBand: COMFORT_BAND,
-      thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
-      achTotal: ventPresetB.achTotal,
-      nightPurgeEnabled: optionB.nightPurgeEnabled ?? false,
-      adaptiveVentEnabled: ventPresetB.isAdaptive === true,
-      spinupHours: effectiveSpinupDays * 24,
-    });
-  }, [optionB, baseParamsTemplate, weatherProvider, effectiveSpinupDays]);
-
-  useEffect(() => {
-    if (!optionA || !optionB) setShowCompare(false);
-  }, [optionA, optionB]);
-
-  const comparisonRows = useMemo(() => {
-    if (!annualA || !annualB) return [];
-    const a = annualA.metrics;
-    const b = annualB.metrics;
-    return [
-      { label: "Hours in comfort", a: a.hoursInComfort, b: b.hoursInComfort, unit: "h" },
-      { label: "Overheating > 26°C", a: a.overheatingHours26, b: b.overheatingHours26, unit: "h" },
-      { label: "Heating degree-hours", a: a.heatingDegreeHours, b: b.heatingDegreeHours, unit: "Kh" },
-      { label: "Cooling degree-hours", a: a.coolingDegreeHours, b: b.coolingDegreeHours, unit: "Kh" },
-    ];
-  }, [annualA, annualB]);
 
   const sunDirection = useMemo(() => {
     const altRad = deg2rad(snapshot.altitude);
@@ -1494,41 +1412,6 @@ export default function App() {
 
             {viewMode === "evaluate" && (
               <>
-                <Card className="space-y-3 p-5">
-                  <div className="flex items-center justify-between">
-                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      A vs B delta
-                    </p>
-                    <p className="text-[10px] text-slate-500">4 key metrics</p>
-                  </div>
-                  {!optionA || !optionB ? (
-                    <p className="text-xs text-slate-500">
-                      Save the current design as A and B to compare annual performance.
-                    </p>
-                  ) : null}
-                  {optionA && optionB && !showCompare ? (
-                    <p className="text-xs text-slate-500">
-                      Click “Compare A vs B” to reveal the deltas.
-                    </p>
-                  ) : null}
-                  {showCompare && annualA && annualB && (
-                    <div className="space-y-2 text-sm text-slate-700">
-                      {comparisonRows.map((row) => {
-                        const delta = row.b - row.a;
-                        const sign = delta > 0 ? "+" : "";
-                        return (
-                          <div key={row.label} className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-2">
-                            <span>{row.label}</span>
-                            <span className="font-mono text-xs">
-                              A {row.a.toFixed(1)} · B {row.b.toFixed(1)} · Δ {sign}{delta.toFixed(1)} {row.unit}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </Card>
-
                 <CostCarbonCard
                   title="Annual cost + carbon"
                   periodLabel="Full year (8,760 h)"
@@ -2032,35 +1915,6 @@ export default function App() {
                 </Card>
               )}
 
-              {viewMode === "evaluate" && (
-                <Card className="space-y-4 p-5">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    Compare options
-                  </p>
-                  <div className="grid gap-2">
-                    <Button size="sm" variant="secondary" onClick={() => setOptionA(currentDesign)}>
-                      Save current as A
-                    </Button>
-                    <Button size="sm" variant="secondary" onClick={() => setOptionB(currentDesign)}>
-                      Save current as B
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant={showCompare ? "default" : "secondary"}
-                      disabled={!optionA || !optionB}
-                      onClick={() => setShowCompare((prev) => !prev)}
-                    >
-                      Compare A vs B
-                    </Button>
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    A: {optionA ? `orient ${Math.round(optionA.orientationDeg)}°, ventilation ${ventilationPresetLabel(optionA.ventilationPreset)}${optionA.nightPurgeEnabled ? " + night purge" : ""}, envelope ${uValuePresetLabel(optionA.uValuePreset)}` : "not set"}
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    B: {optionB ? `orient ${Math.round(optionB.orientationDeg)}°, ventilation ${ventilationPresetLabel(optionB.ventilationPreset)}${optionB.nightPurgeEnabled ? " + night purge" : ""}, envelope ${uValuePresetLabel(optionB.uValuePreset)}` : "not set"}
-                  </p>
-                </Card>
-              )}
             </div>
           </div>
         </div>
