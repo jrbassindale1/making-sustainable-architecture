@@ -17,7 +17,6 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { InfoPopover } from "@/components/ui/info-popover";
-import { loadEpwDataset } from "@/weather/parseEpw";
 import { Vector3 } from "three";
 import { BuildingPreview } from "@/scene/BuildingPreview";
 import { drawOverlays, calculateLayout } from "@/export/OverlayRenderer";
@@ -44,7 +43,6 @@ import {
   U_VALUE_PRESET_ORDER,
   VENTILATION_PRESETS,
   VENTILATION_PRESET_ORDER,
-  WEATHER_FILE_URL,
   LUX_THRESHOLDS,
   buildPreviewFaceConfigs,
   calculateOpeningArea,
@@ -66,7 +64,6 @@ import {
   simulateAnnual1R1C,
   simulateDay1R1C,
   uValuePresetLabel,
-  validateEpwDataset,
   ventilationPresetLabel,
   WINTER_SOLSTICE_DAY,
   SPRING_EQUINOX_DAY,
@@ -111,9 +108,6 @@ export default function App() {
   const [ventilationPreset, setVentilationPreset] = useState(DEFAULT_VENTILATION_PRESET);
   const [nightPurgeEnabled, setNightPurgeEnabled] = useState(false);
   const [uValuePreset, setUValuePreset] = useState(DEFAULT_U_VALUE_PRESET);
-  const [weatherMode, setWeatherMode] = useState("epw");
-  const [epwDataset, setEpwDataset] = useState(null);
-  const [weatherWarning, setWeatherWarning] = useState("");
   const [dayOfYear, setDayOfYear] = useState(initialSolsticeDay);
   const [timeFrac, setTimeFrac] = useState(MIDDAY_TIME_FRAC);
   const [optionA, setOptionA] = useState(null);
@@ -134,74 +128,12 @@ export default function App() {
     return `${cardinalLabel} (${Math.round(azimuth)}°)`;
   };
 
-  useEffect(() => {
-    let active = true;
-
-    loadEpwDataset(WEATHER_FILE_URL)
-      .then((dataset) => {
-        if (!active) return;
-        if (dataset.hours.length !== 8760) {
-          throw new Error(`Expected 8760 rows but got ${dataset.hours.length}.`);
-        }
-
-        const check = validateEpwDataset(dataset);
-        console.info(
-          "[EPW] GBR_WAL_Pencelli.Aux.036100_TMYx loaded:",
-          `tDry ${check.stats.tMin.toFixed(1)} to ${check.stats.tMax.toFixed(1)} C,`,
-          `GHI ${check.stats.ghiMin.toFixed(0)} to ${check.stats.ghiMax.toFixed(0)} Wh/m2`,
-        );
-        if (!check.seasonalCheckPass) {
-          console.warn(
-            `[EPW] Validation warning: January mean (${check.janMean.toFixed(1)} C) is not lower than July mean (${check.julMean.toFixed(1)} C).`,
-          );
-        }
-        if (!check.middayPeakPass) {
-          console.warn(
-            `[EPW] Validation warning: midsummer GHI peak hour (${check.peak.hour}:00) is not near midday.`,
-          );
-        }
-
-        setEpwDataset(dataset);
-        setWeatherWarning("");
-      })
-      .catch((error) => {
-        console.error("[EPW] Weather load failed, falling back to simplified demo weather.", error);
-        if (!active) return;
-        setEpwDataset(null);
-        setWeatherWarning("Weather file failed to load - using simplified demo weather (clear-sky sunlight).");
-      });
-
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    setTimeFrac(MIDDAY_TIME_FRAC);
-  }, [weatherMode]);
-
-  const usingEpw = weatherMode === "epw" && Boolean(epwDataset);
-  const effectiveWeatherMode = usingEpw ? "epw" : "synthetic";
-  const weatherMeta = useMemo(() => {
-    if (!usingEpw || !epwDataset) return DEFAULT_SITE;
-    return {
-      name: epwDataset.meta.name,
-      latitude: epwDataset.meta.lat,
-      longitude: epwDataset.meta.lon,
-      tzHours: epwDataset.meta.tzHours,
-      elevationM: epwDataset.meta.elevationM,
-    };
-  }, [usingEpw, epwDataset]);
+  const effectiveWeatherMode = "synthetic";
+  const weatherMeta = DEFAULT_SITE;
 
   const weatherSummary = useMemo(() => {
-    if (weatherMode === "epw" && usingEpw) {
-      return "Pencelli (Brecon)";
-    }
-    if (weatherMode === "epw" && !weatherWarning) {
-      return "Loading weather file...";
-    }
-    return "Simplified (demo)";
-  }, [weatherMode, usingEpw, weatherWarning]);
+    return "Simplified (Pencilli - Brecon)";
+  }, []);
 
   const seasonalMarks = useMemo(() => {
     const isNorthern = weatherMeta.latitude >= 0;
@@ -218,14 +150,8 @@ export default function App() {
   }, [weatherMeta.latitude]);
 
   const weatherDescription = useMemo(() => {
-    if (weatherMode === "epw" && usingEpw) {
-      return "Real hourly weather file: measured temperature + sunlight; cloud effects already included.";
-    }
-    if (weatherMode === "epw" && !weatherWarning) {
-      return "Loading the Pencelli (Brecon) weather file.";
-    }
-    return "Simplified temperature curve with clear-sky sunlight. Not real weather; no cloud data (demo/fallback).";
-  }, [weatherMode, usingEpw, weatherWarning]);
+    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencilli - Brecon.";
+  }, []);
 
   const activeUPreset = useMemo(
     () => U_VALUE_PRESETS[uValuePreset] ?? U_VALUE_PRESETS[DEFAULT_U_VALUE_PRESET],
@@ -312,10 +238,10 @@ export default function App() {
   const weatherProvider = useMemo(
     () => ({
       mode: effectiveWeatherMode,
-      dataset: usingEpw ? epwDataset : null,
+      dataset: null,
       syntheticProfile: SYNTHETIC_PROFILE,
     }),
-    [effectiveWeatherMode, usingEpw, epwDataset],
+    [effectiveWeatherMode],
   );
 
   const sunWindow = useMemo(
@@ -1515,33 +1441,21 @@ export default function App() {
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-xs font-medium text-slate-600">Weather source</p>
                           <div className="flex flex-col gap-2">
-                            <Button
-                              size="sm"
-                              variant={weatherMode === "epw" ? "default" : "secondary"}
-                              className="w-full justify-start"
-                              onClick={() => setWeatherMode("epw")}
-                            >
-                              Pencelli (Brecon)
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant={weatherMode === "synthetic" ? "default" : "secondary"}
-                              className="w-full justify-start"
-                              onClick={() => setWeatherMode("synthetic")}
-                            >
-                              Simplified (demo)
+                            <Button size="sm" variant="default" className="w-full justify-start" disabled>
+                              Simplified (Pencilli - Brecon)
                             </Button>
                           </div>
                           <p className="text-xs text-slate-600">{weatherDescription}</p>
+                          <p className="text-xs text-slate-500">
+                            Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
+                            swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
+                            useful for highlighting likely overheating and underheating periods.
+                          </p>
                           <p className="text-xs text-slate-500">
                             {Math.abs(weatherMeta.latitude).toFixed(3)}°{weatherMeta.latitude >= 0 ? "N" : "S"},{" "}
                             {Math.abs(weatherMeta.longitude).toFixed(3)}°{weatherMeta.longitude >= 0 ? "E" : "W"} ·
                             TZ {weatherMeta.tzHours >= 0 ? `+${weatherMeta.tzHours}` : weatherMeta.tzHours}
                           </p>
-                          {weatherMode === "epw" && !epwDataset && !weatherWarning && (
-                            <p className="text-xs text-slate-500">Loading weather file...</p>
-                          )}
-                          {weatherWarning && <p className="text-xs text-amber-700">{weatherWarning}</p>}
                         </div>
                         <div className="relative z-0 info-popover-host space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <InfoPopover className="right-2 top-2">

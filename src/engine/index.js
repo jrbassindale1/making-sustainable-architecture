@@ -26,7 +26,7 @@ export const BUILDING_HEIGHT = 2.6;
 
 export const U_VALUE_PRESETS = {
   baseline: {
-    label: "Baseline (2025 default)",
+    label: "Baseline - Building Regs 2025",
     detail: "Low-E double glazing and solid insulation.",
     values: {
       wall: 0.35,
@@ -36,7 +36,7 @@ export const U_VALUE_PRESETS = {
     },
   },
   improved: {
-    label: "Improved retrofit",
+    label: "25% Above Baseline",
     detail: "Upgraded insulation and better glazing.",
     values: {
       wall: 0.25,
@@ -50,14 +50,14 @@ export const U_VALUE_PRESETS = {
     detail: "Super-insulated envelope with high spec glazing.",
     values: {
       wall: 0.15,
-      roof: 0.1,
+      roof: 0.15,
       floor: 0.15,
       window: 0.7,
     },
   },
 };
 export const U_VALUE_PRESET_ORDER = ["baseline", "improved", "high"];
-export const DEFAULT_U_VALUE_PRESET = "baseline";
+export const DEFAULT_U_VALUE_PRESET = "high";
 
 export const MODEL_YEAR = 2025;
 export const DAYS_PER_YEAR = 365;
