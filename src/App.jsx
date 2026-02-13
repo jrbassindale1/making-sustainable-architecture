@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   LineChart,
   Line,
@@ -60,7 +60,6 @@ import {
   forcingAt,
   formatClockTime,
   formatHourRange,
-  formatMonthDay,
   formatMonthDayTime,
   isNightHour,
   normalizedAzimuth,
@@ -124,10 +123,6 @@ export default function App() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportingPdf, setExportingPdf] = useState(false);
   const [exportError, setExportError] = useState("");
-  const dateSliderWrapRef = useRef(null);
-  const dateSliderRef = useRef(null);
-  const [dateSliderMetrics, setDateSliderMetrics] = useState({ left: 0, width: 0 });
-
   const mainCaptureRef = useRef(null);
   const settingsCaptureRef = useRef(null);
 
@@ -185,39 +180,6 @@ export default function App() {
     setTimeFrac(MIDDAY_TIME_FRAC);
   }, [weatherMode]);
 
-  useLayoutEffect(() => {
-    if (typeof window === "undefined" || typeof ResizeObserver === "undefined") return undefined;
-    const wrap = dateSliderWrapRef.current;
-    const slider = dateSliderRef.current;
-    if (!wrap || !slider) return undefined;
-
-    let lastLeft = null;
-    let lastWidth = null;
-
-    const update = () => {
-      const wrapRect = wrap.getBoundingClientRect();
-      const sliderRect = slider.getBoundingClientRect();
-      const newLeft = sliderRect.left - wrapRect.left;
-      const newWidth = sliderRect.width;
-      // Only update state if values actually changed to prevent infinite loops
-      if (newLeft !== lastLeft || newWidth !== lastWidth) {
-        lastLeft = newLeft;
-        lastWidth = newWidth;
-        setDateSliderMetrics({ left: newLeft, width: newWidth });
-      }
-    };
-
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(wrap);
-    observer.observe(slider);
-    window.addEventListener("resize", update);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", update);
-    };
-  }, []);
-
   const usingEpw = weatherMode === "epw" && Boolean(epwDataset);
   const effectiveWeatherMode = usingEpw ? "epw" : "synthetic";
   const weatherMeta = useMemo(() => {
@@ -247,28 +209,13 @@ export default function App() {
     const winterDay = isNorthern ? WINTER_SOLSTICE_DAY : SUMMER_SOLSTICE_DAY;
     const marchLabel = isNorthern ? "Spring equinox" : "Autumn equinox";
     const septLabel = isNorthern ? "Autumn equinox" : "Spring equinox";
-    const positionFromDay = (day) =>
-      ((day - 1) / (DAYS_PER_YEAR - 1)) * 100;
-    const positionPxFromDay = (day) => {
-      if (!dateSliderMetrics.width) return null;
-      // Don't add dateSliderMetrics.left - the marker container uses absolute inset-0
-      // which positions it at the wrapper's padding-box edge, same as the slider
-      return (positionFromDay(day) / 100) * dateSliderMetrics.width;
-    };
-    const makeMark = (day, label) => ({
-      day,
-      label,
-      dateLabel: formatMonthDay(dateFromDayOfYearUTC(day)),
-      position: positionFromDay(day),
-      positionPx: positionPxFromDay(day),
-    });
     return [
-      makeMark(summerDay, "Summer solstice"),
-      makeMark(winterDay, "Winter solstice"),
-      makeMark(SPRING_EQUINOX_DAY, marchLabel),
-      makeMark(AUTUMN_EQUINOX_DAY, septLabel),
+      { day: summerDay, label: "Summer solstice" },
+      { day: winterDay, label: "Winter solstice" },
+      { day: SPRING_EQUINOX_DAY, label: marchLabel },
+      { day: AUTUMN_EQUINOX_DAY, label: septLabel },
     ].sort((a, b) => a.day - b.day);
-  }, [weatherMeta.latitude, dateSliderMetrics.left, dateSliderMetrics.width]);
+  }, [weatherMeta.latitude]);
 
   const weatherDescription = useMemo(() => {
     if (weatherMode === "epw" && usingEpw) {
@@ -1133,12 +1080,26 @@ export default function App() {
                                   Fresh air rate is the total air changes per hour (ACH) from the chosen
                                   preset, including background infiltration.
                                 </p>
-                                <p className="mt-2 text-xs text-slate-600">
-                                  For {achTotalAtTime.toFixed(1)} ACH with cross-ventilation, you would need
-                                  roughly <strong>{opening.areaM2.toFixed(2)} m²</strong> of free opening area —
-                                  equivalent to a window sash {opening.sashSideMm}mm × {opening.sashSideMm}mm fully
-                                  open, or a 600mm × 600mm casement opened to ~{opening.casementPercent}%.
-                                </p>
+                                {achTotalAtTime <= 0.3 ? (
+                                  <p className="mt-2 text-xs text-slate-600">
+                                    At {achTotalAtTime.toFixed(1)} ACH, this represents typical background
+                                    infiltration through the building fabric (gaps, cracks, and services) rather
+                                    than deliberate openable ventilation.
+                                  </p>
+                                ) : achTotalAtTime <= 0.6 ? (
+                                  <p className="mt-2 text-xs text-slate-600">
+                                    At {achTotalAtTime.toFixed(1)} ACH, this represents trickle ventilation through
+                                    small permanent openings (e.g. trickle vents in window frames) rather than
+                                    openable windows.
+                                  </p>
+                                ) : (
+                                  <p className="mt-2 text-xs text-slate-600">
+                                    For {achTotalAtTime.toFixed(1)} ACH with cross-ventilation, you would need
+                                    roughly <strong>{opening.areaM2.toFixed(2)} m²</strong> of free opening area —
+                                    equivalent to a window sash {opening.sashSideMm}mm × {opening.sashSideMm}mm fully
+                                    open, or a 600mm × 600mm casement opened to ~{opening.casementPercent}%.
+                                  </p>
+                                )}
                               </>
                             );
                           })()}
@@ -1604,37 +1565,26 @@ export default function App() {
                         <span>Date</span>
                         <span>{selectedDateLabel}</span>
                       </div>
-                      <div className="pb-6">
-                        <div className="relative px-2" ref={dateSliderWrapRef}>
-                          <Slider
-                            ref={dateSliderRef}
-                            className="relative z-10"
-                            value={[dayOfYear]}
-                            min={1}
-                            max={DAYS_PER_YEAR}
-                            step={1}
-                            onValueChange={(v) => setDayOfYear(Math.round(v[0]))}
-                          />
-                          <div className="pointer-events-none absolute left-2 right-2 top-1/2 h-2 -translate-y-1/2">
-                            {seasonalMarks.map((mark) => (
-                              <button
-                                key={mark.label}
-                                type="button"
-                                onClick={() => setDayOfYear(mark.day)}
-                                className="group pointer-events-auto absolute -translate-x-1/2 text-left"
-                                style={{ left: `${mark.position}%` }}
-                              >
-                                <span className="pointer-events-none block h-3 w-px bg-slate-400/70" />
-                                <span className="mt-1 block whitespace-nowrap text-[9px] font-semibold text-slate-500 transition-colors group-hover:text-slate-700">
-                                  {mark.label}
-                                </span>
-                                <span className="block whitespace-nowrap text-[9px] text-slate-400 transition-colors group-hover:text-slate-500">
-                                  {mark.dateLabel}
-                                </span>
-                              </button>
-                            ))}
-                          </div>
-                        </div>
+                      <div className="px-2">
+                        <Slider
+                          value={[dayOfYear]}
+                          min={1}
+                          max={DAYS_PER_YEAR}
+                          step={1}
+                          onValueChange={(v) => setDayOfYear(Math.round(v[0]))}
+                        />
+                      </div>
+                      <div className="flex flex-wrap justify-center gap-x-3 gap-y-1">
+                        {seasonalMarks.map((mark) => (
+                          <button
+                            key={mark.label}
+                            type="button"
+                            onClick={() => setDayOfYear(mark.day)}
+                            className="text-[10px] text-slate-500 hover:text-slate-900 hover:underline"
+                          >
+                            {mark.label}
+                          </button>
+                        ))}
                       </div>
                     </div>
                     <div className="space-y-2">
