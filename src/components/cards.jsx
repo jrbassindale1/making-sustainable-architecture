@@ -67,9 +67,13 @@ export function Metric({ label, value, helper, accent }) {
 }
 
 /* -------------------- Insights -------------------- */
-export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
+export function InsightsCard({ snapshot, faceConfigs, ventilationSummary, dimensions }) {
+  const width = Number.isFinite(dimensions?.width) ? dimensions.width : BUILDING_WIDTH;
+  const depth = Number.isFinite(dimensions?.depth) ? dimensions.depth : BUILDING_DEPTH;
+  const height = Number.isFinite(dimensions?.height) ? dimensions.height : BUILDING_HEIGHT;
   const sunUp = snapshot.altitude > 0;
   const byFace = snapshot.Q_solar_byFace;
+  const totalFacadeSolarGain = Object.values(byFace || {}).reduce((sum, value) => sum + (value || 0), 0);
 
   const sorted = Object.entries(byFace).sort(([, a], [, b]) => b - a);
   const dominantFace = sorted[0];
@@ -78,7 +82,7 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
     ? "The sun is below the horizon right now — slide to daylight to see how each face performs."
     : dominantFace[1] > 0
       ? `The ${dominantFace[0]} face is receiving the most solar gain (${Math.round(dominantFace[1])} W). ` +
-        `Total solar gain across all faces is ${Math.round(snapshot.Q_solar)} W.`
+        `Total solar gain across all faces is ${Math.round(totalFacadeSolarGain)} W.`
       : "No direct solar gain on any face at this time.";
 
   const shadedFaces = FACES.filter(
@@ -92,10 +96,10 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
       : `External shading is active on the ${shadedFaces.map((f) => f.label).join(", ")} face${shadedFaces.length > 1 ? "s" : ""}.`;
 
   const totalGlazingArea = FACES.reduce((sum, f) => {
-    const faceSpan = f.id === "east" || f.id === "west" ? BUILDING_DEPTH : BUILDING_WIDTH;
-    return sum + faceSpan * faceConfigs[f.id].glazing * BUILDING_HEIGHT;
+    const faceSpan = f.id === "east" || f.id === "west" ? depth : width;
+    return sum + faceSpan * faceConfigs[f.id].glazing * height;
   }, 0);
-  const totalWallArea = 2 * (BUILDING_WIDTH + BUILDING_DEPTH) * BUILDING_HEIGHT;
+  const totalWallArea = 2 * (width + depth) * height;
   const overallWWR = totalGlazingArea / totalWallArea;
   const glazingSentence = `Overall window-to-wall ratio is ${Math.round(overallWWR * 100)}% (${totalGlazingArea.toFixed(1)} m² of glazing across ${totalWallArea.toFixed(0)} m² of facade).`;
 
@@ -126,7 +130,6 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
 
 export function OutcomeCard({
   currentPoint,
-  comfortBand,
   timeLabel,
   dateLabel,
   outdoorTemp,
