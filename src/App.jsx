@@ -856,10 +856,10 @@ export default function App() {
       `West (${faceFacingLabel(FACES.find((f) => f.id === "west"))}): ${Math.round((faceWWR.west ?? 0) * 100)}%`,
     ].join("\n");
     const shadingSummary = [
-      `North: overhang ${faceState.north.overhang.toFixed(2)}, vertical fins ${faceState.north.fin.toFixed(2)}, horizontal fins ${faceState.north.hFin.toFixed(2)}`,
-      `East: overhang ${faceState.east.overhang.toFixed(2)}, vertical fins ${faceState.east.fin.toFixed(2)}, horizontal fins ${faceState.east.hFin.toFixed(2)}`,
-      `South: overhang ${faceState.south.overhang.toFixed(2)}, vertical fins ${faceState.south.fin.toFixed(2)}, horizontal fins ${faceState.south.hFin.toFixed(2)}`,
-      `West: overhang ${faceState.west.overhang.toFixed(2)}, vertical fins ${faceState.west.fin.toFixed(2)}, horizontal fins ${faceState.west.hFin.toFixed(2)}`,
+      `North: overhang ${(faceState.north.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.north.fin.toFixed(2)}, horizontal fins ${faceState.north.hFin.toFixed(2)}`,
+      `East: overhang ${(faceState.east.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.east.fin.toFixed(2)}, horizontal fins ${faceState.east.hFin.toFixed(2)}`,
+      `South: overhang ${(faceState.south.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.south.fin.toFixed(2)}, horizontal fins ${faceState.south.hFin.toFixed(2)}`,
+      `West: overhang ${(faceState.west.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.west.fin.toFixed(2)}, horizontal fins ${faceState.west.hFin.toFixed(2)}`,
     ].join("\n");
     const fabricSummary = [
       `Preset: ${activeUPreset.label}`,
@@ -2423,13 +2423,13 @@ export default function App() {
                                 </p>
                               </div>
                               <SliderField
-                                label="Overhang ratio (d/h)"
+                                label="Overhang depth"
                                 value={config.overhang}
                                 onChange={(v) => updateFace(face.id, "overhang", v)}
                                 min={0}
-                                max={0.5}
-                                step={0.05}
-                                formatValue={(v) => v.toFixed(2)}
+                                max={1.5}
+                                step={0.1}
+                                formatValue={(v) => `${(v * 1000).toFixed(0)} mm`}
                               />
                               <SliderField
                                 label="Vertical fins"

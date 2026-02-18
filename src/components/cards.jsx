@@ -88,7 +88,7 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary, dimens
   const shadedFaces = FACES.filter(
     (f) =>
       faceConfigs[f.id].glazing > 0 &&
-      (faceConfigs[f.id].overhang > 0.05 || faceConfigs[f.id].fin > 0.05),
+      (faceConfigs[f.id].overhang > 0.1 || faceConfigs[f.id].fin > 0.05),
   );
   const shadingSentence =
     shadedFaces.length === 0

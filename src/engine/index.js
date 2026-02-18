@@ -891,6 +891,7 @@ export function ratioToDepthMeters(ratio, buildingHeight = BUILDING_HEIGHT) {
 }
 
 export const MIN_WINDOW_CLEAR_HEIGHT = 0.4;
+const EXTERNAL_SHADING_PROJECTION_M = 0.3; // 300 mm projection for fins/louvers
 
 export function resolveWindowOpeningHeight(
   openingHeight,
@@ -1067,7 +1068,7 @@ export function buildWindowsFromFaceState(
       w: faceSpan * glazing,
       h: opening.effectiveHeight,
       az: normalizedAzimuth(face.azimuth + orientationDeg),
-      overhangDepth: ratioToDepthMeters(config.overhang, height),
+      overhangDepth: Math.max(0, Math.min(1.5, config.overhang || 0)),
       finDepth: ratioToDepthMeters(config.fin, height),
       hFinDepth: ratioToDepthMeters(config.hFin, height),
     };
@@ -1089,7 +1090,7 @@ export function buildPreviewFaceConfigs(faceState, dimensions = {}) {
     const glazing = Math.max(0, Math.min(0.8, config.glazing));
     acc[face.id] = {
       glazing,
-      overhang: ratioToDepthMeters(config.overhang, height),
+      overhang: Math.max(0, Math.min(1.5, config.overhang || 0)),
       fin: ratioToDepthMeters(config.fin, height),
       hFin: ratioToDepthMeters(config.hFin, height),
       windowCenterRatio: clampWindowCenterRatio(glazing, config.windowCenterRatio ?? 0),
@@ -1266,8 +1267,8 @@ export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzim
   const dAzDeg = ((azimuthDeg - surfaceAzimuthDeg + 540) % 360) - 180;
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
-  // Brise-soleil geometry: fins at regular intervals with fixed 0.5m projection
-  const FIN_PROJECTION = 0.5; // Fixed 50cm projection
+  // Brise-soleil geometry: fins at regular intervals with fixed projection
+  const FIN_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
   const MIN_GAP = 0.15; // Minimum gap between fins (dense)
   const MAX_GAP = 1.2; // Maximum gap between fins (sparse)
 
@@ -1293,7 +1294,7 @@ export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azim
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
   // Horizontal louver geometry: slats at regular intervals with fixed projection
-  const SLAT_PROJECTION = 0.5; // Fixed 50cm projection (matches vertical fins)
+  const SLAT_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
   const MIN_GAP = 0.1; // Minimum gap between slats (dense)
   const MAX_GAP = 0.6; // Maximum gap between slats (sparse)
 
