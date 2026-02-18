@@ -318,7 +318,7 @@ export function WallFace({
         basePositions.push(rightJambX);
 
         // finDepth controls subdivision: 0 = just base positions, max = dense subdivisions
-        const ratio = Math.min(1, finDepth / 2.6);
+        const ratio = Math.min(1, finDepth / Math.max(0.001, faceHeight));
         // Calculate subdivisions per bay (0 at low ratio, up to 4 at max)
         const subdivisionsPerBay = Math.floor(ratio * 5);
 
@@ -421,7 +421,7 @@ export function WallFace({
         // Map hFinDepth ratio to spacing (same as vertical fins)
         const MIN_GAP = 0.1; // 10cm spacing (dense)
         const MAX_GAP = 0.6; // 60cm spacing (sparse)
-        const ratio = Math.min(1, hFinDepth / 2.6);
+        const ratio = Math.min(1, hFinDepth / Math.max(0.001, faceHeight));
         const slatGap = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
 
         // Calculate vertical span with 30cm clearance from top and ground

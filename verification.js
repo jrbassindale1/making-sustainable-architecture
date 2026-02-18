@@ -209,31 +209,40 @@ console.log("Expected range: 20-100 hours for current 1R1C assumptions");
 console.log(`RESULT: ${tauPass ? "PASS ✓" : "FAIL ✗"}`);
 console.log();
 
-// Test 5: Verify against CIBSE Guide A benchmarks
-console.log("TEST 5: CIBSE Guide A Benchmark Comparison");
+// Test 5: Ventilation sensitivity check
+console.log("TEST 5: Ventilation Sensitivity Check");
 console.log("-".repeat(50));
-console.log("Reference: CIBSE Guide A Table 5.6 - Overheating criteria");
+console.log("Scenario: fixed summer gains, compare steady-state temperature vs ACH");
 console.log();
-console.log("For a naturally ventilated office in Bristol:");
-console.log("  - Indoor operative temp should not exceed 28°C for more than 1% of occupied hours");
-console.log("  - Peak summer indoor temp for well-designed building: ~25-28°C");
-console.log();
-console.log(
-  `Model predictions with LOW-E glazing (g=0.4, U_window=${roomParams.U_window.toFixed(2)}):`,
-);
-console.log(`  - Steady-state peak (max solar): ${heatBalance.steadyStateTemp.toFixed(1)}°C`);
 
-// More realistic scenario with reduced solar
-const realisticSolar = 800; // W (more typical midday value with low-E + some cloud)
-const realisticBalance = verifyHeatBalance({
-  T_in: 25,
-  T_out: 20, // Typical Bristol summer
-  Q_solar: realisticSolar,
+const sensitivityScenario = {
+  T_out: 20,
+  Q_solar: 800,
   Q_internal: 180,
-  UA_fabric,
-  UA_vent,
+};
+const achLevels = [0.3, 3.0, 6.0];
+const steadyTemps = achLevels.map((ach) => {
+  const uaVentLocal = (1.2 * 1006 * ach * volume) / 3600;
+  const result = verifyHeatBalance({
+    T_in: 25,
+    T_out: sensitivityScenario.T_out,
+    Q_solar: sensitivityScenario.Q_solar,
+    Q_internal: sensitivityScenario.Q_internal,
+    UA_fabric,
+    UA_vent: uaVentLocal,
+  });
+  return { ach, temp: result.steadyStateTemp };
 });
-console.log(`  - Typical summer day (800W solar): ${realisticBalance.steadyStateTemp.toFixed(1)}°C`);
+
+steadyTemps.forEach((entry) => {
+  console.log(
+    `  ACH ${entry.ach.toFixed(1)} -> steady-state ${entry.temp.toFixed(1)}°C`,
+  );
+});
+const ventSensitivityPass =
+  steadyTemps[0].temp > steadyTemps[1].temp &&
+  steadyTemps[1].temp > steadyTemps[2].temp;
+console.log(`RESULT: ${ventSensitivityPass ? "PASS ✓" : "FAIL ✗"}`);
 console.log();
 
 // Summary
@@ -243,6 +252,7 @@ console.log("=".repeat(60));
 console.log(`Solar position June 21:     ${june21Pass ? "PASS ✓" : "FAIL ✗"}`);
 console.log(`Solar position Dec 21:      ${dec21Pass ? "PASS ✓" : "FAIL ✗"}`);
 console.log(`Thermal time constant:      ${tauPass ? "PASS ✓" : "FAIL ✗"}`);
+console.log(`Ventilation sensitivity:    ${ventSensitivityPass ? "PASS ✓" : "FAIL ✗"}`);
 console.log();
 console.log("NOTES:");
 console.log("- Heat balance equations follow ISO 52016-1 simplified method");
@@ -310,14 +320,15 @@ console.log("✓ Solar position algorithm: ACCURATE (within 0.1 degrees)");
 console.log("✓ Heat balance equations: PHYSICALLY CORRECT");
 console.log("✓ EPW weather data: VALID Bristol TMYx dataset");
 console.log("✓ Solar gain calculations: REASONABLE for glazing config");
+console.log("✓ Ventilation trend: higher ACH lowers steady-state summer temperature");
 console.log();
-console.log("⚠ High temperatures are due to DESIGN CHOICES, not errors:");
-console.log("  - 32% glazing ratio with minimal E/W shading");
-console.log("  - Only 2 ACH ventilation");
-console.log("  - Night ventilation closed (security mode)");
+console.log("Illustrative sensitivity (T_out=20°C, gains=980W):");
+console.log(`  - ${steadyTemps[0].ach.toFixed(1)} ACH -> ${steadyTemps[0].temp.toFixed(1)}°C steady-state`);
+console.log(`  - ${steadyTemps[1].ach.toFixed(1)} ACH -> ${steadyTemps[1].temp.toFixed(1)}°C steady-state`);
+console.log(`  - ${steadyTemps[2].ach.toFixed(1)} ACH -> ${steadyTemps[2].temp.toFixed(1)}°C steady-state`);
 console.log();
 console.log("RECOMMENDATIONS:");
 console.log("  1. Add external shading to East and West faces");
-console.log("  2. Enable night purge ventilation (5 ACH)");
+console.log("  2. Enable higher ventilation rates (e.g., night purge to 6 ACH)");
 console.log("  3. Reduce glazing or use solar control glass (g<0.3)");
 console.log("  4. Consider 25% glazing ratio max for passive design");

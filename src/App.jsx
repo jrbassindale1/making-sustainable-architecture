@@ -1514,12 +1514,6 @@ export default function App() {
                       >
                         {comfortStatusLabel}
                       </p>
-                      {ventilationComfort.apparentCoolingC >= 0.3 && (
-                        <p className="pr-8 text-[11px] text-slate-600">
-                          Draught-adjusted feel: {perceivedComfortLabel} at{" "}
-                          {ventilationComfort.perceivedTempC.toFixed(1)}°C.
-                        </p>
-                      )}
                     </Card>
                     <div className="grid gap-1 sm:grid-cols-3 lg:grid-cols-1 lg:min-h-0">
                       <OutcomeCard
@@ -1601,10 +1595,10 @@ export default function App() {
                                   </p>
                                 )}
                                 <p className="mt-2 text-xs text-slate-600">
-                                  <strong>{ventilationComfort.label}:</strong> apparent cooling is about{" "}
-                                  <strong>{ventilationComfort.apparentCoolingC.toFixed(1)}°C</strong> at this time,
-                                  so {indoorTempAtTime.toFixed(1)}°C air may feel closer to{" "}
-                                  <strong>{ventilationComfort.perceivedTempC.toFixed(1)}°C</strong>.
+                                  <strong>Draught-adjusted feel:</strong> {perceivedComfortLabel} at{" "}
+                                  <strong>{ventilationComfort.perceivedTempC.toFixed(1)}°C</strong>. This estimates
+                                  how moving air changes perceived temperature; apparent cooling is about{" "}
+                                  <strong>{ventilationComfort.apparentCoolingC.toFixed(1)}°C</strong> at this time.
                                 </p>
                                 {achTotalAtTime <= 0.3 ? (
                                   <p className="mt-2 text-xs text-slate-600">
