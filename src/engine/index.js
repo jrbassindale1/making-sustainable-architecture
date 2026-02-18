@@ -1260,7 +1260,7 @@ export function overhangShadingFraction(windowH, depth_m, altDeg, azimuthDeg, su
   return Math.max(0, Math.min(1, L / windowH));
 }
 
-export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzimuthDeg) {
+export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzimuthDeg, overhangDepth = 0, altitudeDeg = 45) {
   if (finDepth_m <= 0) return 0;
 
   // Check if sun is hitting this surface (within ±90° of surface normal)
@@ -1268,9 +1268,10 @@ export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzim
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
   // Brise-soleil geometry: fins at regular intervals with fixed projection
+  // These values match the visual rendering in BuildingPreview.jsx/WallFace.jsx
   const FIN_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
-  const MIN_GAP = 0.15; // Minimum gap between fins (dense)
-  const MAX_GAP = 1.2; // Maximum gap between fins (sparse)
+  const MIN_GAP = 0.1; // 10cm spacing (dense) - matches rendering
+  const MAX_GAP = 0.6; // 60cm spacing (sparse) - matches rendering
 
   // finDepth_m is actually a ratio encoded as meters (0 to ~2.6m)
   // Convert back to 0-1 ratio to calculate gap
@@ -1282,11 +1283,30 @@ export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzim
   const dAz = deg2rad(dAzDeg);
   const shadowWidth = Math.abs(FIN_PROJECTION * Math.tan(dAz));
 
-  // Shading fraction is the ratio of shadow width to gap between fins
-  return Math.max(0, Math.min(1, shadowWidth / gap));
+  // Base shading fraction is the ratio of shadow width to gap between fins
+  let shadingFraction = shadowWidth / gap;
+
+  // When fins are at overhang position (> 1m from face), they move out between columns
+  // Account for shadow geometry - shadows must travel further to reach the window
+  if (overhangDepth > 1) {
+    // Actual distance from fins to window plane (accounting for fin projection)
+    const distanceFromWindow = overhangDepth - FIN_PROJECTION / 2;
+
+    // At low altitudes, shadows from distant fins may fall below the window
+    // Shadow drop over distance = distance / tan(altitude)
+    const altRad = deg2rad(Math.max(5, altitudeDeg));
+    const shadowDrop = distanceFromWindow / Math.tan(altRad);
+
+    // Reduce effectiveness proportionally based on how much shadow misses the window
+    // At 1.5m overhang (max), shadow drop is significant at low sun angles
+    const dropFactor = Math.max(0, 1 - shadowDrop / (windowH * 1.5));
+    shadingFraction *= dropFactor;
+  }
+
+  return Math.max(0, Math.min(1, shadingFraction));
 }
 
-export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azimuthDeg, surfaceAzimuthDeg) {
+export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azimuthDeg, surfaceAzimuthDeg, overhangDepth = 0) {
   if (hFinDepth_m <= 0 || altDeg <= 0) return 0;
 
   // Check if sun is hitting this surface (within ±90° of surface normal)
@@ -1294,9 +1314,10 @@ export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azim
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
   // Horizontal louver geometry: slats at regular intervals with fixed projection
+  // These values match the visual rendering in BuildingPreview.jsx/WallFace.jsx
   const SLAT_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
-  const MIN_GAP = 0.1; // Minimum gap between slats (dense)
-  const MAX_GAP = 0.6; // Maximum gap between slats (sparse)
+  const MIN_GAP = 0.1; // 10cm spacing (dense) - matches rendering
+  const MAX_GAP = 0.6; // 60cm spacing (sparse) - matches rendering
 
   // hFinDepth_m is a ratio encoded as meters (0 to ~2.6m)
   // Convert back to 0-1 ratio to calculate gap
@@ -1309,8 +1330,27 @@ export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azim
   if (phi <= 0) return 0;
   const shadowDepth = SLAT_PROJECTION * Math.tan(deg2rad(phi));
 
-  // Shading fraction is the ratio of shadow depth to gap between slats
-  return Math.max(0, Math.min(1, shadowDepth / gap));
+  // Base shading fraction is the ratio of shadow depth to gap between slats
+  let shadingFraction = shadowDepth / gap;
+
+  // When louvres are at overhang position (> 1m from face), they move out between columns
+  // Account for shadow geometry - shadows must travel further to reach the window
+  if (overhangDepth > 1) {
+    // Actual distance from louvres to window plane (accounting for slat projection)
+    const distanceFromWindow = overhangDepth - SLAT_PROJECTION / 2;
+
+    // At low profile angles, shadows from distant louvres may fall in front of window
+    // Shadow vertical drop over horizontal distance = distance / tan(profile angle)
+    const phiRad = deg2rad(Math.max(5, phi));
+    const shadowDrop = distanceFromWindow / Math.tan(phiRad);
+
+    // Reduce effectiveness proportionally based on how much shadow misses the window
+    // At 1.5m overhang (max), shadow drop is significant at low profile angles
+    const dropFactor = Math.max(0, 1 - shadowDrop / (windowH * 1.5));
+    shadingFraction *= dropFactor;
+  }
+
+  return Math.max(0, Math.min(1, shadingFraction));
 }
 
 export function cardinalFromAzimuth(azimuthDeg) {
@@ -1422,8 +1462,8 @@ export function computeSnapshot(params) {
     });
 
     const fracOverhang = overhangShadingFraction(w.h, w.overhangDepth || 0, altitude, azimuth, w.az);
-    const fracVFins = finsShadingFraction(w.h, w.finDepth || 0, azimuth, w.az);
-    const fracHFins = horizontalFinsShadingFraction(w.h, w.hFinDepth || 0, altitude, azimuth, w.az);
+    const fracVFins = finsShadingFraction(w.h, w.finDepth || 0, azimuth, w.az, w.overhangDepth || 0, altitude);
+    const fracHFins = horizontalFinsShadingFraction(w.h, w.hFinDepth || 0, altitude, azimuth, w.az, w.overhangDepth || 0);
     const fracExt = Math.max(0, Math.min(1, 1 - (1 - fracOverhang) * (1 - fracVFins) * (1 - fracHFins)));
 
     const I_beam_shaded = I_beam * (1 - fracExt);

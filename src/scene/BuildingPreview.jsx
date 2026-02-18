@@ -92,6 +92,7 @@ function OperableWindowLeaf({
   showInteractionHint = true,
   frameMaterialProps,
   glassMaterialProps,
+  onHoverClickable,
 }) {
   const turnPivotRef = useRef(null);
   const tiltGroupRef = useRef(null);
@@ -163,14 +164,16 @@ function OperableWindowLeaf({
       if (!showInteractionHint) return;
       event.stopPropagation();
       setHovered(true);
+      onHoverClickable?.(true);
     },
-    [showInteractionHint]
+    [showInteractionHint, onHoverClickable]
   );
   const handleLeafHoverEnd = useCallback((event) => {
     if (!showInteractionHint) return;
     event.stopPropagation();
     setHovered(false);
-  }, [showInteractionHint]);
+    onHoverClickable?.(false);
+  }, [showInteractionHint, onHoverClickable]);
   const interactionHintText = useMemo(() => {
     if (safeWindowState === WINDOW_SEGMENT_STATE.CLOSED) return "tap to open";
     if (safeWindowState === WINDOW_SEGMENT_STATE.TOP_HUNG) return "tap to open wider";
@@ -262,6 +265,7 @@ function WallFace({
   shadingMaterialProps,
   cillMaterialProps,
   captureMode = false,
+  onHoverClickable,
 }) {
   useThree(); // Keep hook for R3F context
   const wt = WALL_THICKNESS;
@@ -337,12 +341,14 @@ function WallFace({
     if (!enableWindowToggle) return;
     event.stopPropagation();
     setWindowAreaHovered(true);
-  }, [enableWindowToggle]);
+    onHoverClickable?.(true);
+  }, [enableWindowToggle, onHoverClickable]);
   const handleWindowAreaHoverEnd = useCallback((event) => {
     if (!enableWindowToggle) return;
     event.stopPropagation();
     setWindowAreaHovered(false);
-  }, [enableWindowToggle]);
+    onHoverClickable?.(false);
+  }, [enableWindowToggle, onHoverClickable]);
 
 
   if (glazingPct <= 0.001) {
@@ -475,6 +481,7 @@ function WallFace({
               showInteractionHint={false}
               frameMaterialProps={frameMaterialProps}
               glassMaterialProps={glassMaterialProps}
+              onHoverClickable={onHoverClickable}
             />
           );
         })}
@@ -518,6 +525,15 @@ function WallFace({
           ? -wt / 2 - overhangDepth + FIN_PROJECTION / 2 - SHADING_FACE_GAP
           : -wt / 2 - FIN_PROJECTION / 2 - SHADING_FACE_GAP;
 
+        // Calculate column span extensions (same as horizontal louvres)
+        const leftSpanExtension = shadingLeftHasColumn
+          ? Math.max(0, shadingLeftExtension - OVERHANG_COLUMN_SIZE)
+          : 0;
+        const rightSpanExtension = shadingRightHasColumn
+          ? Math.max(0, shadingRightExtension - OVERHANG_COLUMN_SIZE)
+          : 0;
+        const spanFromColumns = hasOverhangColumns && (shadingLeftHasColumn || shadingRightHasColumn);
+
         // Base positions match window mullion rhythm
         const basePositions = [leftJambX];
         // Add mullion positions (between each leaf)
@@ -533,7 +549,7 @@ function WallFace({
         const subdivisionsPerBay = Math.floor(ratio * 5);
 
         // Build final fin positions with subdivisions
-        const fins = [];
+        let fins = [];
         for (let i = 0; i < basePositions.length; i++) {
           fins.push(basePositions[i]);
           // Add subdivisions between this position and the next
@@ -546,16 +562,54 @@ function WallFace({
           }
         }
 
+        // When spanning between columns, expand fins to fill the column width
+        // using a consistent spacing based on finDepth (same approach as horizontal louvres)
+        if (spanFromColumns) {
+          // Calculate the expanded span boundaries with 30cm clearance from columns
+          const COLUMN_CLEARANCE = 0.3;
+          const expandedLeft = -faceWidth / 2 - leftSpanExtension + COLUMN_CLEARANCE;
+          const expandedRight = faceWidth / 2 + rightSpanExtension - COLUMN_CLEARANCE;
+          const totalWidth = expandedRight - expandedLeft;
+
+          // Map finDepth ratio to spacing (same as horizontal louvres)
+          // Higher ratio = smaller gap = more fins
+          const MIN_GAP = 0.1; // 10cm spacing (dense)
+          const MAX_GAP = 0.6; // 60cm spacing (sparse)
+          const finSpacing = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
+
+          // Calculate number of fins and center them
+          const numFins = Math.floor(totalWidth / finSpacing) + 1;
+          const actualSpan = (numFins - 1) * finSpacing;
+          const startOffset = (totalWidth - actualSpan) / 2;
+
+          // Rebuild fins array centered between columns
+          const expandedFins = [];
+          for (let i = 0; i < numFins; i++) {
+            expandedFins.push(expandedLeft + startOffset + i * finSpacing);
+          }
+          fins = expandedFins;
+        }
+
+        // When spanning between columns, fins extend from outside ground level to soffit
+        // Outside ground is at -BUILDING_LIFT (building is lifted above ground)
+        // Otherwise, fins are centered on the window
+        const finHeight = spanFromColumns
+          ? faceHeight + BUILDING_LIFT
+          : windowHeight + 0.1;
+        const finCenterY = spanFromColumns
+          ? (faceHeight - BUILDING_LIFT) / 2
+          : windowBottomY + windowHeight / 2;
+
         return (
           <group>
             {fins.map((finX, i) => (
               <mesh
                 key={i}
-                position={[finX, windowBottomY + windowHeight / 2, finCenterZ]}
+                position={[finX, finCenterY, finCenterZ]}
                 castShadow
                 receiveShadow
               >
-                <boxGeometry args={[FIN_THICKNESS, windowHeight + 0.1, FIN_PROJECTION]} />
+                <boxGeometry args={[FIN_THICKNESS, finHeight, FIN_PROJECTION]} />
                 <meshPhysicalMaterial {...finAndLouverMaterialProps} />
               </mesh>
             ))}
@@ -570,49 +624,95 @@ function WallFace({
         const slatCenterZ = hasOverhangColumns
           ? -wt / 2 - overhangDepth + SLAT_PROJECTION / 2 - SHADING_FACE_GAP
           : -wt / 2 - SLAT_PROJECTION / 2 - SHADING_FACE_GAP;
-        const leftSpanExtension = shadingLeftHasColumn
+
+        // Only span from columns if this face actually has an overhang with columns
+        const leftSpanExtension = (hasOverhangColumns && shadingLeftHasColumn)
           ? Math.max(0, shadingLeftExtension - OVERHANG_COLUMN_SIZE)
           : 0;
-        const rightSpanExtension = shadingRightHasColumn
+        const rightSpanExtension = (hasOverhangColumns && shadingRightHasColumn)
           ? Math.max(0, shadingRightExtension - OVERHANG_COLUMN_SIZE)
           : 0;
-        const spanFromColumns = shadingLeftHasColumn || shadingRightHasColumn;
-        const slatWidth = spanFromColumns
-          ? Math.max(0.05, faceWidth + leftSpanExtension + rightSpanExtension)
-          : windowWidth + 0.1;
-        const slatCenterX = spanFromColumns
-          ? (rightSpanExtension - leftSpanExtension) / 2
-          : windowCenterX;
-        const MIN_GAP = 0.1; // Minimum 10cm between slats (dense)
-        const MAX_GAP = 0.6; // Maximum 60cm between slats (sparse)
+        const spanFromColumns = hasOverhangColumns && (shadingLeftHasColumn || shadingRightHasColumn);
 
-        // hFinDepth is in meters (0 to ~2.6m), convert back to 0-1 ratio
+        // Calculate span - horizontal fins go all the way to column edges
+        const expandedLeft = spanFromColumns
+          ? -faceWidth / 2 - leftSpanExtension
+          : windowCenterX - windowWidth / 2 - 0.05;
+        const expandedRight = spanFromColumns
+          ? faceWidth / 2 + rightSpanExtension
+          : windowCenterX + windowWidth / 2 + 0.05;
+        const slatWidth = expandedRight - expandedLeft;
+        const slatCenterX = (expandedLeft + expandedRight) / 2;
+
+        // Map hFinDepth ratio to spacing (same as vertical fins)
+        const MIN_GAP = 0.1; // 10cm spacing (dense)
+        const MAX_GAP = 0.6; // 60cm spacing (sparse)
         const ratio = Math.min(1, hFinDepth / 2.6);
-        // Map ratio to gap: higher ratio = smaller gap = more slats
         const slatGap = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
 
-        // Calculate slat positions across the window height
-        const slats = [];
-        const startY = windowBottomY;
-        const endY = windowTopY;
+        // Calculate vertical span with 30cm clearance from top and ground
+        const VERTICAL_CLEARANCE = 0.3;
+        const startY = spanFromColumns ? -BUILDING_LIFT + VERTICAL_CLEARANCE : windowBottomY;
+        const endY = spanFromColumns ? faceHeight - VERTICAL_CLEARANCE : windowTopY;
+        const totalHeight = endY - startY;
 
-        // Place slats at regular intervals
-        let y = startY + slatGap;
-        while (y <= endY - 0.001) {
-          slats.push(y);
-          y += slatGap;
+        // Calculate number of slats and center them vertically
+        const numSlats = Math.max(1, Math.floor(totalHeight / slatGap) + 1);
+        const actualSpan = (numSlats - 1) * slatGap;
+        const startOffset = (totalHeight - actualSpan) / 2;
+
+        // Build centered slat positions
+        const slats = [];
+        for (let i = 0; i < numSlats; i++) {
+          slats.push(startY + startOffset + i * slatGap);
         }
+
+        // Calculate tie rod positions (every 1.5m, centered, min 1m from columns)
+        const TIE_ROD_SIZE = 0.02; // 20mm x 20mm
+        const TIE_ROD_SPACING = 1.5;
+        const TIE_ROD_COLUMN_CLEARANCE = 1.0;
+        const tieRods = [];
+
+        if (spanFromColumns) {
+          const tieRodLeft = expandedLeft + TIE_ROD_COLUMN_CLEARANCE;
+          const tieRodRight = expandedRight - TIE_ROD_COLUMN_CLEARANCE;
+          const tieRodSpan = tieRodRight - tieRodLeft;
+
+          if (tieRodSpan > 0) {
+            const numTieRods = Math.max(1, Math.floor(tieRodSpan / TIE_ROD_SPACING) + 1);
+            const actualTieRodSpan = (numTieRods - 1) * TIE_ROD_SPACING;
+            const tieRodStartOffset = (tieRodSpan - actualTieRodSpan) / 2;
+
+            for (let i = 0; i < numTieRods; i++) {
+              tieRods.push(tieRodLeft + tieRodStartOffset + i * TIE_ROD_SPACING);
+            }
+          }
+        }
+
+        const tieRodHeight = faceHeight + BUILDING_LIFT;
+        const tieRodCenterY = (faceHeight - BUILDING_LIFT) / 2;
 
         return (
           <group>
             {slats.map((slatY, i) => (
               <mesh
-                key={i}
+                key={`slat-${i}`}
                 position={[slatCenterX, slatY, slatCenterZ]}
                 castShadow
                 receiveShadow
               >
                 <boxGeometry args={[slatWidth, SLAT_THICKNESS, SLAT_PROJECTION]} />
+                <meshPhysicalMaterial {...finAndLouverMaterialProps} />
+              </mesh>
+            ))}
+            {tieRods.map((tieRodX, i) => (
+              <mesh
+                key={`tie-${i}`}
+                position={[tieRodX, tieRodCenterY, slatCenterZ]}
+                castShadow
+                receiveShadow
+              >
+                <boxGeometry args={[TIE_ROD_SIZE, tieRodHeight, TIE_ROD_SIZE]} />
                 <meshPhysicalMaterial {...finAndLouverMaterialProps} />
               </mesh>
             ))}
@@ -1090,7 +1190,7 @@ function RoofGrass({
     const safeW = Math.max(0.2, patchWidth);
     const safeD = Math.max(0.2, patchDepth);
     const area = safeW * safeD;
-    const bladeDensityMultiplier = 7;
+    const bladeDensityMultiplier = 3; // Reduced from 7 for performance
     const bladesPerTuft = 3;
     const tuftCount = Math.min(
       7000 * bladeDensityMultiplier,
@@ -1380,6 +1480,7 @@ function RoomModel({
   onToggleWindowSegment,
   onResizeWindowGlazing,
   onJambDragStateChange,
+  onHoverClickable,
   rooflightSpec,
   rooflightEnabled = true,
   onToggleRooflight,
@@ -1488,13 +1589,15 @@ function RoomModel({
       event.stopPropagation();
       if (captureMode || !hasRooflight) return;
       setRooflightHovered(true);
+      onHoverClickable?.(true);
     },
-    [captureMode, hasRooflight]
+    [captureMode, hasRooflight, onHoverClickable]
   );
   const handleRooflightHoverEnd = useCallback((event) => {
     event.stopPropagation();
     setRooflightHovered(false);
-  }, []);
+    onHoverClickable?.(false);
+  }, [onHoverClickable]);
   const rooflightInteractionHintText = useMemo(() => {
     if (!hasRooflight) return "";
     return resolvedRooflight.openHeight > 0.001 ? "tap to close" : "tap to open";
@@ -1929,6 +2032,80 @@ function RoomModel({
     const fallbackY = Math.max(0.2, height - DOWNLIGHT_TRIM_THICKNESS_M / 2);
     return points.map(([x, pointY, z]) => [x, pointY ?? fallbackY, z]);
   }, [halfW, halfD, height]);
+
+  // External soffit downlights - activated when overhang is deep enough to have columns (> 1m)
+  const externalSoffitDownlightLayout = useMemo(() => {
+    const y = Math.max(0.2, height - DOWNLIGHT_TRIM_THICKNESS_M / 2);
+    const targetY = -BUILDING_LIFT; // Aim at ground level
+    const lights = [];
+
+    // South face soffit lights
+    if (southOverhang > 1.0) {
+      const minX = -(halfW + WALL_THICKNESS + westOverhang);
+      const maxX = halfW + WALL_THICKNESS + eastOverhang;
+      const spanX = maxX - minX;
+      if (spanX > 0.001) {
+        const soffitCenterZ = -(halfD + WALL_THICKNESS + southOverhang / 2);
+        lights.push(
+          { key: "south-1", position: [minX + spanX / 3, y, soffitCenterZ], targetY },
+          { key: "south-2", position: [minX + (spanX * 2) / 3, y, soffitCenterZ], targetY },
+        );
+      }
+    }
+
+    // North face soffit lights
+    if (northOverhang > 1.0) {
+      const minX = -(halfW + WALL_THICKNESS + westOverhang);
+      const maxX = halfW + WALL_THICKNESS + eastOverhang;
+      const spanX = maxX - minX;
+      if (spanX > 0.001) {
+        const soffitCenterZ = halfD + WALL_THICKNESS + northOverhang / 2;
+        lights.push(
+          { key: "north-1", position: [minX + spanX / 3, y, soffitCenterZ], targetY },
+          { key: "north-2", position: [minX + (spanX * 2) / 3, y, soffitCenterZ], targetY },
+        );
+      }
+    }
+
+    // East face soffit lights
+    if (eastOverhang > 1.0) {
+      const minZ = -(halfD + WALL_THICKNESS + southOverhang);
+      const maxZ = halfD + WALL_THICKNESS + northOverhang;
+      const spanZ = maxZ - minZ;
+      if (spanZ > 0.001) {
+        const soffitCenterX = halfW + WALL_THICKNESS + eastOverhang / 2;
+        lights.push(
+          { key: "east-1", position: [soffitCenterX, y, minZ + spanZ / 3], targetY },
+          { key: "east-2", position: [soffitCenterX, y, minZ + (spanZ * 2) / 3], targetY },
+        );
+      }
+    }
+
+    // West face soffit lights
+    if (westOverhang > 1.0) {
+      const minZ = -(halfD + WALL_THICKNESS + southOverhang);
+      const maxZ = halfD + WALL_THICKNESS + northOverhang;
+      const spanZ = maxZ - minZ;
+      if (spanZ > 0.001) {
+        const soffitCenterX = -(halfW + WALL_THICKNESS + westOverhang / 2);
+        lights.push(
+          { key: "west-1", position: [soffitCenterX, y, minZ + spanZ / 3], targetY },
+          { key: "west-2", position: [soffitCenterX, y, minZ + (spanZ * 2) / 3], targetY },
+        );
+      }
+    }
+
+    return lights;
+  }, [
+    height,
+    halfW,
+    halfD,
+    southOverhang,
+    northOverhang,
+    eastOverhang,
+    westOverhang,
+  ]);
+
   const resolvedDownlightIntensity = Math.max(
     0,
     Number.isFinite(downlightIntensity) ? downlightIntensity : 60,
@@ -2287,6 +2464,22 @@ function RoomModel({
           />
         ))}
 
+        {/* External soffit downlights (when overhang has columns) */}
+        {externalSoffitDownlightLayout.map(({ key, position, targetY }) => (
+          <CeilingDownlight
+            key={`soffit-downlight-${key}`}
+            position={position}
+            downlightsOn={downlightsOn}
+            intensity={resolvedDownlightIntensity}
+            throwScale={resolvedDownlightThrowScale}
+            angle={resolvedDownlightAngle}
+            penumbra={resolvedDownlightPenumbra}
+            sourceGlow={resolvedDownlightSourceGlow}
+            roomHeight={height + BUILDING_LIFT}
+            targetY={targetY}
+          />
+        ))}
+
         {/* South face (z = -halfD internal, wall outside room) */}
         <group position={[0, 0, -halfD - WALL_THICKNESS / 2]}>
           <WallFace
@@ -2314,6 +2507,7 @@ function RoomModel({
             shadingMaterialProps={shadingMaterialProps}
             cillMaterialProps={frameMaterialProps}
             captureMode={captureMode}
+            onHoverClickable={onHoverClickable}
           />
         </group>
 
@@ -2344,6 +2538,7 @@ function RoomModel({
             shadingMaterialProps={shadingMaterialProps}
             cillMaterialProps={frameMaterialProps}
             captureMode={captureMode}
+            onHoverClickable={onHoverClickable}
           />
         </group>
 
@@ -2374,6 +2569,7 @@ function RoomModel({
             shadingMaterialProps={shadingMaterialProps}
             cillMaterialProps={frameMaterialProps}
             captureMode={captureMode}
+            onHoverClickable={onHoverClickable}
           />
         </group>
 
@@ -2404,6 +2600,7 @@ function RoomModel({
             shadingMaterialProps={shadingMaterialProps}
             cillMaterialProps={frameMaterialProps}
             captureMode={captureMode}
+            onHoverClickable={onHoverClickable}
           />
         </group>
 
@@ -2827,9 +3024,9 @@ function CeilingDownlight({
   penumbra,
   sourceGlow,
   roomHeight,
+  targetY = 0,
 }) {
   const lightRef = useRef(null);
-  const spillLightRef = useRef(null);
   const glowRadius = Math.max(
     DOWNLIGHT_TRIM_RADIUS_M * 0.28,
     Math.min(
@@ -2840,84 +3037,51 @@ function CeilingDownlight({
   const glowOpacityOn = Math.max(0.12, Math.min(1, 0.38 + sourceGlow * 0.38));
 
   useEffect(() => {
-    const lights = [lightRef.current, spillLightRef.current].filter(Boolean);
-    if (lights.length === 0) return;
-    lights.forEach((light) => {
-      light.parent?.add?.(light.target);
-      light.target.position.set(position[0], 0, position[2]);
-      light.target.updateMatrixWorld();
-    });
+    const light = lightRef.current;
+    if (!light) return;
+    light.parent?.add?.(light.target);
+    light.target.position.set(position[0], targetY, position[2]);
+    light.target.updateMatrixWorld();
     return () => {
-      lights.forEach((light) => {
-        light.parent?.remove?.(light.target);
-      });
+      light.parent?.remove?.(light.target);
     };
-  }, [position]);
+  }, [position, targetY]);
 
   return (
     <group>
-      <mesh position={position} rotation={[Math.PI / 2, 0, 0]} castShadow={false} receiveShadow>
+      <mesh position={position} castShadow={false} receiveShadow>
         <cylinderGeometry
           args={[DOWNLIGHT_TRIM_RADIUS_M, DOWNLIGHT_TRIM_RADIUS_M, DOWNLIGHT_TRIM_THICKNESS_M, 24]}
         />
         <meshPhysicalMaterial color="#cbd5e1" roughness={0.35} metalness={0.72} />
       </mesh>
       <mesh
-        position={[position[0], position[1] - DOWNLIGHT_TRIM_THICKNESS_M * 0.9, position[2]]}
+        position={[position[0], position[1] - DOWNLIGHT_TRIM_THICKNESS_M / 2 - 0.002, position[2]]}
         rotation={[Math.PI / 2, 0, 0]}
         castShadow={false}
         receiveShadow={false}
       >
-        <cylinderGeometry
-          args={[glowRadius, glowRadius, DOWNLIGHT_TRIM_THICKNESS_M * 0.3, 24]}
-        />
-        <meshBasicMaterial
-          color={downlightsOn ? "#fff6d5" : "#9ca3af"}
-          transparent
-          opacity={downlightsOn ? glowOpacityOn : 0.06}
-          blending={AdditiveBlending}
-          depthWrite={false}
-        />
-      </mesh>
-      <mesh
-        visible={downlightsOn}
-        position={[position[0], position[1] - DOWNLIGHT_BEAM_LENGTH_M / 2, position[2]]}
-        rotation={[Math.PI, 0, 0]}
-        castShadow={false}
-        receiveShadow={false}
-      >
-        <coneGeometry args={[DOWNLIGHT_BEAM_RADIUS_M, DOWNLIGHT_BEAM_LENGTH_M, 24]} />
-        <meshBasicMaterial
-          color="#fff8de"
-          transparent
-          opacity={0.98}
+        <circleGeometry args={[DOWNLIGHT_TRIM_RADIUS_M * 0.7, 16]} />
+        <meshStandardMaterial
+          color={downlightsOn ? "#fff8e0" : "#f5f5f5"}
+          emissive={downlightsOn ? "#ffeecc" : "#000000"}
+          emissiveIntensity={downlightsOn ? 2 : 0}
         />
       </mesh>
       <spotLight
         ref={lightRef}
         position={[position[0], position[1] - 0.05, position[2]]}
-        intensity={downlightsOn ? intensity : 0}
+        intensity={downlightsOn ? intensity * 1.4 : 0}
         color="#ffe8bb"
-        distance={Math.max(1.8, roomHeight * throwScale)}
-        angle={angle}
-        penumbra={penumbra}
+        distance={Math.max(2.2, roomHeight * throwScale * 1.2)}
+        angle={Math.min(1.0, angle * 1.15)}
+        penumbra={Math.max(0.7, penumbra)}
         decay={2}
         castShadow={downlightsOn}
-        shadow-mapSize-width={512}
-        shadow-mapSize-height={512}
-        shadow-bias={-0.00008}
-        shadow-normalBias={0.02}
-      />
-      <spotLight
-        ref={spillLightRef}
-        position={[position[0], position[1] - 0.06, position[2]]}
-        intensity={downlightsOn ? intensity * 0.6 : 0}
-        color="#ffefc7"
-        distance={Math.max(2.2, roomHeight * throwScale * 1.35)}
-        angle={Math.min(1.05, angle * 1.45)}
-        penumbra={Math.max(0.85, penumbra)}
-        decay={2}
-        castShadow={false}
+        shadow-mapSize-width={256}
+        shadow-mapSize-height={256}
+        shadow-bias={-0.0001}
+        shadow-normalBias={0.03}
       />
     </group>
   );
@@ -2984,12 +3148,12 @@ function SunOrb({ position, opacity }) {
   );
 }
 
-function ScenePostProcessing({ sunFactor, captureMode }) {
+function ScenePostProcessing({ sunFactor }) {
   return (
-    <EffectComposer multisampling={captureMode ? 2 : 4} enableNormalPass>
+    <EffectComposer multisampling={4} enableNormalPass>
       <SSAO
         blendFunction={BlendFunction.MULTIPLY}
-        samples={captureMode ? 8 : 14}
+        samples={14}
         radius={0.085}
         intensity={15}
         luminanceInfluence={0.25}
@@ -3090,6 +3254,26 @@ export function BuildingPreview({
   }, [buildingWidth, buildingDepth, orientationDeg]);
   const lightRef = useRef(null);
   const [isJambDragging, setIsJambDragging] = useState(false);
+  const [isShiftHeld, setIsShiftHeld] = useState(false);
+  const [isMouseDown, setIsMouseDown] = useState(false);
+  const [isOverClickable, setIsOverClickable] = useState(false);
+
+  // Blue pointer cursor as data URL
+  const bluePointerCursor = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%232563eb' d='M7 2l12 11.5-5.5 1 3.5 7-2.5 1-3.5-7L7 19V2z'/%3E%3C/svg%3E") 4 2, pointer`;
+
+  useEffect(() => {
+    const handleKeyDown = (e) => e.key === "Shift" && setIsShiftHeld(true);
+    const handleKeyUp = (e) => e.key === "Shift" && setIsShiftHeld(false);
+    const handleMouseUp = () => setIsMouseDown(false);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, []);
 
   useEffect(() => {
     const light = lightRef.current;
@@ -3119,7 +3303,11 @@ export function BuildingPreview({
 
   return (
     <Card className={cardClass}>
-      <div className={`${canvasClass} overflow-hidden rounded-lg bg-slate-200`}>
+      <div
+        className={`${canvasClass} overflow-hidden rounded-lg bg-slate-200 ${isShiftHeld ? "cursor-move" : isMouseDown ? "cursor-grabbing" : !isOverClickable ? "cursor-pointer" : ""}`}
+        style={isOverClickable && !isShiftHeld && !isMouseDown ? { cursor: bluePointerCursor } : undefined}
+        onMouseDown={() => setIsMouseDown(true)}
+      >
         <Canvas
           shadows
           dpr={[1, 1.5]}
@@ -3149,8 +3337,8 @@ export function BuildingPreview({
             shadow-normalBias={0.02}
           />
           <SunOrb position={sunSpherePosition} opacity={sunSphereOpacity} />
-          {!captureMode && <Environment preset="sunset" intensity={0.9 * sunFactor} />}
-          {!captureMode && <Environment preset="night" intensity={0.55 * (1 - sunFactor)} />}
+          <Environment preset="sunset" intensity={0.9 * sunFactor} />
+          <Environment preset="night" intensity={0.55 * (1 - sunFactor)} />
           <Compass northLineStartRadius={compassNorthLineStartRadius} />
           <RoomModel
             faceConfigs={faceConfigs}
@@ -3165,6 +3353,7 @@ export function BuildingPreview({
             onToggleWindowSegment={onToggleWindowSegment}
             onResizeWindowGlazing={onResizeWindowGlazing}
             onJambDragStateChange={setIsJambDragging}
+            onHoverClickable={setIsOverClickable}
             rooflightSpec={rooflightSpec}
             rooflightEnabled={rooflightEnabled}
             onToggleRooflight={onToggleRooflight}
@@ -3187,7 +3376,7 @@ export function BuildingPreview({
             maxPolarAngle={Math.PI / 1.85}
             target={[0, height / 2, 0]}
           />
-          <ScenePostProcessing sunFactor={sunFactor} captureMode={captureMode} />
+          <ScenePostProcessing sunFactor={sunFactor} />
         </Canvas>
       </div>
       {showMetrics && (

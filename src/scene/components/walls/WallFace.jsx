@@ -16,6 +16,7 @@ import {
   WINDOW_CILL_FRAME_OVERLAP,
   WINDOW_CILL_VERTICAL_OVERLAP,
   OVERHANG_COLUMN_SIZE,
+  BUILDING_LIFT,
 } from "../../constants/architecture";
 import { OperableWindowLeaf } from "../windows/OperableWindowLeaf";
 
@@ -298,6 +299,15 @@ export function WallFace({
           ? -wt / 2 - overhangDepth + FIN_PROJECTION / 2 - SHADING_FACE_GAP
           : -wt / 2 - FIN_PROJECTION / 2 - SHADING_FACE_GAP;
 
+        // Calculate column span extensions (same as horizontal louvres)
+        const leftSpanExtension = shadingLeftHasColumn
+          ? Math.max(0, shadingLeftExtension - OVERHANG_COLUMN_SIZE)
+          : 0;
+        const rightSpanExtension = shadingRightHasColumn
+          ? Math.max(0, shadingRightExtension - OVERHANG_COLUMN_SIZE)
+          : 0;
+        const spanFromColumns = hasOverhangColumns && (shadingLeftHasColumn || shadingRightHasColumn);
+
         // Base positions match window mullion rhythm
         const basePositions = [leftJambX];
         // Add mullion positions (between each leaf)
@@ -313,7 +323,7 @@ export function WallFace({
         const subdivisionsPerBay = Math.floor(ratio * 5);
 
         // Build final fin positions with subdivisions
-        const fins = [];
+        let fins = [];
         for (let i = 0; i < basePositions.length; i++) {
           fins.push(basePositions[i]);
           // Add subdivisions between this position and the next
@@ -326,16 +336,54 @@ export function WallFace({
           }
         }
 
+        // When spanning between columns, expand fins to fill the column width
+        // using a consistent spacing based on finDepth (same approach as horizontal louvres)
+        if (spanFromColumns) {
+          // Calculate the expanded span boundaries with 30cm clearance from columns
+          const COLUMN_CLEARANCE = 0.3;
+          const expandedLeft = -faceWidth / 2 - leftSpanExtension + COLUMN_CLEARANCE;
+          const expandedRight = faceWidth / 2 + rightSpanExtension - COLUMN_CLEARANCE;
+          const totalWidth = expandedRight - expandedLeft;
+
+          // Map finDepth ratio to spacing (same as horizontal louvres)
+          // Higher ratio = smaller gap = more fins
+          const MIN_GAP = 0.1; // 10cm spacing (dense)
+          const MAX_GAP = 0.6; // 60cm spacing (sparse)
+          const finSpacing = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
+
+          // Calculate number of fins and center them
+          const numFins = Math.floor(totalWidth / finSpacing) + 1;
+          const actualSpan = (numFins - 1) * finSpacing;
+          const startOffset = (totalWidth - actualSpan) / 2;
+
+          // Rebuild fins array centered between columns
+          const expandedFins = [];
+          for (let i = 0; i < numFins; i++) {
+            expandedFins.push(expandedLeft + startOffset + i * finSpacing);
+          }
+          fins = expandedFins;
+        }
+
+        // When spanning between columns, fins extend from outside ground level to soffit
+        // Outside ground is at -BUILDING_LIFT (building is lifted above ground)
+        // Otherwise, fins are centered on the window
+        const finHeight = spanFromColumns
+          ? faceHeight + BUILDING_LIFT
+          : windowHeight + 0.1;
+        const finCenterY = spanFromColumns
+          ? (faceHeight - BUILDING_LIFT) / 2
+          : windowBottomY + windowHeight / 2;
+
         return (
           <group>
             {fins.map((finX, i) => (
               <mesh
                 key={i}
-                position={[finX, windowBottomY + windowHeight / 2, finCenterZ]}
+                position={[finX, finCenterY, finCenterZ]}
                 castShadow
                 receiveShadow
               >
-                <boxGeometry args={[FIN_THICKNESS, windowHeight + 0.1, FIN_PROJECTION]} />
+                <boxGeometry args={[FIN_THICKNESS, finHeight, FIN_PROJECTION]} />
                 <meshPhysicalMaterial {...finAndLouverMaterialProps} />
               </mesh>
             ))}
@@ -350,49 +398,95 @@ export function WallFace({
         const slatCenterZ = hasOverhangColumns
           ? -wt / 2 - overhangDepth + SLAT_PROJECTION / 2 - SHADING_FACE_GAP
           : -wt / 2 - SLAT_PROJECTION / 2 - SHADING_FACE_GAP;
-        const leftSpanExtension = shadingLeftHasColumn
+
+        // Only span from columns if this face actually has an overhang with columns
+        const leftSpanExtension = (hasOverhangColumns && shadingLeftHasColumn)
           ? Math.max(0, shadingLeftExtension - OVERHANG_COLUMN_SIZE)
           : 0;
-        const rightSpanExtension = shadingRightHasColumn
+        const rightSpanExtension = (hasOverhangColumns && shadingRightHasColumn)
           ? Math.max(0, shadingRightExtension - OVERHANG_COLUMN_SIZE)
           : 0;
-        const spanFromColumns = shadingLeftHasColumn || shadingRightHasColumn;
-        const slatWidth = spanFromColumns
-          ? Math.max(0.05, faceWidth + leftSpanExtension + rightSpanExtension)
-          : windowWidth + 0.1;
-        const slatCenterX = spanFromColumns
-          ? (rightSpanExtension - leftSpanExtension) / 2
-          : windowCenterX;
-        const MIN_GAP = 0.1; // Minimum 10cm between slats (dense)
-        const MAX_GAP = 0.6; // Maximum 60cm between slats (sparse)
+        const spanFromColumns = hasOverhangColumns && (shadingLeftHasColumn || shadingRightHasColumn);
 
-        // hFinDepth is in meters (0 to ~2.6m), convert back to 0-1 ratio
+        // Calculate span - horizontal fins go all the way to column edges
+        const expandedLeft = spanFromColumns
+          ? -faceWidth / 2 - leftSpanExtension
+          : windowCenterX - windowWidth / 2 - 0.05;
+        const expandedRight = spanFromColumns
+          ? faceWidth / 2 + rightSpanExtension
+          : windowCenterX + windowWidth / 2 + 0.05;
+        const slatWidth = expandedRight - expandedLeft;
+        const slatCenterX = (expandedLeft + expandedRight) / 2;
+
+        // Map hFinDepth ratio to spacing (same as vertical fins)
+        const MIN_GAP = 0.1; // 10cm spacing (dense)
+        const MAX_GAP = 0.6; // 60cm spacing (sparse)
         const ratio = Math.min(1, hFinDepth / 2.6);
-        // Map ratio to gap: higher ratio = smaller gap = more slats
         const slatGap = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
 
-        // Calculate slat positions across the window height
-        const slats = [];
-        const startY = windowBottomY;
-        const endY = windowTopY;
+        // Calculate vertical span with 30cm clearance from top and ground
+        const VERTICAL_CLEARANCE = 0.3;
+        const startY = spanFromColumns ? -BUILDING_LIFT + VERTICAL_CLEARANCE : windowBottomY;
+        const endY = spanFromColumns ? faceHeight - VERTICAL_CLEARANCE : windowTopY;
+        const totalHeight = endY - startY;
 
-        // Place slats at regular intervals
-        let y = startY + slatGap;
-        while (y <= endY - 0.001) {
-          slats.push(y);
-          y += slatGap;
+        // Calculate number of slats and center them vertically
+        const numSlats = Math.max(1, Math.floor(totalHeight / slatGap) + 1);
+        const actualSpan = (numSlats - 1) * slatGap;
+        const startOffset = (totalHeight - actualSpan) / 2;
+
+        // Build centered slat positions
+        const slats = [];
+        for (let i = 0; i < numSlats; i++) {
+          slats.push(startY + startOffset + i * slatGap);
         }
+
+        // Calculate tie rod positions (every 1.5m, centered, min 1m from columns)
+        const TIE_ROD_SIZE = 0.02; // 20mm x 20mm
+        const TIE_ROD_SPACING = 1.5;
+        const TIE_ROD_COLUMN_CLEARANCE = 1.0;
+        const tieRods = [];
+
+        if (spanFromColumns) {
+          const tieRodLeft = expandedLeft + TIE_ROD_COLUMN_CLEARANCE;
+          const tieRodRight = expandedRight - TIE_ROD_COLUMN_CLEARANCE;
+          const tieRodSpan = tieRodRight - tieRodLeft;
+
+          if (tieRodSpan > 0) {
+            const numTieRods = Math.max(1, Math.floor(tieRodSpan / TIE_ROD_SPACING) + 1);
+            const actualTieRodSpan = (numTieRods - 1) * TIE_ROD_SPACING;
+            const tieRodStartOffset = (tieRodSpan - actualTieRodSpan) / 2;
+
+            for (let i = 0; i < numTieRods; i++) {
+              tieRods.push(tieRodLeft + tieRodStartOffset + i * TIE_ROD_SPACING);
+            }
+          }
+        }
+
+        const tieRodHeight = faceHeight + BUILDING_LIFT;
+        const tieRodCenterY = (faceHeight - BUILDING_LIFT) / 2;
 
         return (
           <group>
             {slats.map((slatY, i) => (
               <mesh
-                key={i}
+                key={`slat-${i}`}
                 position={[slatCenterX, slatY, slatCenterZ]}
                 castShadow
                 receiveShadow
               >
                 <boxGeometry args={[slatWidth, SLAT_THICKNESS, SLAT_PROJECTION]} />
+                <meshPhysicalMaterial {...finAndLouverMaterialProps} />
+              </mesh>
+            ))}
+            {tieRods.map((tieRodX, i) => (
+              <mesh
+                key={`tie-${i}`}
+                position={[tieRodX, tieRodCenterY, slatCenterZ]}
+                castShadow
+                receiveShadow
+              >
+                <boxGeometry args={[TIE_ROD_SIZE, tieRodHeight, TIE_ROD_SIZE]} />
                 <meshPhysicalMaterial {...finAndLouverMaterialProps} />
               </mesh>
             ))}

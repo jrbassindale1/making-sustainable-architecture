@@ -127,6 +127,12 @@ export default function App() {
         next.windowCenterRatio = clampWindowCenterRatio(glazing, current.windowCenterRatio ?? 0);
       } else if (field === "windowCenterRatio") {
         next.windowCenterRatio = clampWindowCenterRatio(current.glazing ?? 0, value);
+      } else if (field === "fin" && value > 0) {
+        // Vertical and horizontal fins are mutually exclusive
+        next.hFin = 0;
+      } else if (field === "hFin" && value > 0) {
+        // Vertical and horizontal fins are mutually exclusive
+        next.fin = 0;
       }
       return { ...prev, [faceId]: next };
     });
@@ -163,6 +169,13 @@ export default function App() {
   const moreDetailsRef = useRef(null);
   const dailyChartContainerRef = useRef(null);
   const [dailyChartSize, setDailyChartSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!exportingVideo || typeof document === "undefined") return;
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }, [exportingVideo]);
 
   const faceFacingLabel = (face) => {
     const azimuth = normalizedAzimuth(face.azimuth + orientationDeg);
@@ -1340,12 +1353,16 @@ export default function App() {
     <div className="relative min-h-screen bg-[#f5f3ee] lg:h-[100svh] lg:overflow-hidden">
       <div className="pointer-events-none absolute inset-0 opacity-[0.35] [background-image:linear-gradient(to_right,rgba(15,23,42,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(15,23,42,0.08)_1px,transparent_1px)] [background-size:24px_24px]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.65),transparent_55%)]" />
-      <main className="relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5">
+      <main
+        className={`relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5 ${exportingVideo ? "pointer-events-none select-none" : ""}`}
+        aria-busy={exportingVideo}
+        inert={exportingVideo}
+      >
         <header className="flex flex-col gap-3 border-b border-slate-200/70 pb-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="space-y-1">
               <p className="text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-500">
-                Making Sustainable Architecture
+                Making Sustainable Architecture @ UWE Bristol
               </p>
               <h1 className="font-display text-2xl font-semibold text-slate-900 md:text-3xl">
                 Envelope, light, and comfort.
@@ -2551,6 +2568,23 @@ export default function App() {
                             disabled={adaptiveVentEnabled}
                           />
                         </div>
+                        <div className="rounded-lg border border-slate-200 bg-white p-3">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="w-full"
+                            onClick={() => {
+                              setOpenWindowSegments({});
+                              setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
+                              setVentilationPreset("background");
+                            }}
+                          >
+                            Close all windows
+                          </Button>
+                          <p className="mt-2 text-xs text-slate-500">
+                            Closes all manually opened windows and rooflight, resets to background trickle ventilation.
+                          </p>
+                        </div>
                       </div>
                     )}
 
@@ -2628,6 +2662,15 @@ export default function App() {
         </div>
 
       </main>
+      {exportingVideo && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/45 backdrop-blur-[2px]">
+          <div className="flex min-w-[260px] flex-col items-center gap-4 rounded-2xl border border-slate-300/70 bg-[#f5f3ee] px-8 py-7 shadow-2xl">
+            <div className="h-20 w-20 animate-spin rounded-full border-[7px] border-slate-300 border-t-slate-800" />
+            <p className="text-sm font-semibold tracking-wide text-slate-800">Recording video...</p>
+            <p className="text-xs text-slate-600">Progress: {Math.round(exportProgress * 100)}%</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
