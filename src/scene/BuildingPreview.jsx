@@ -1929,80 +1929,6 @@ function RoomModel({
     const fallbackY = Math.max(0.2, height - DOWNLIGHT_TRIM_THICKNESS_M / 2);
     return points.map(([x, pointY, z]) => [x, pointY ?? fallbackY, z]);
   }, [halfW, halfD, height]);
-
-  // External soffit downlights - activated when overhang is deep enough to have columns (> 1m)
-  const externalSoffitDownlightLayout = useMemo(() => {
-    const y = Math.max(0.2, height - DOWNLIGHT_TRIM_THICKNESS_M / 2);
-    const targetY = -BUILDING_LIFT; // Aim at ground level
-    const lights = [];
-
-    // South face soffit lights
-    if (southOverhang > 1.0) {
-      const minX = -(halfW + WALL_THICKNESS + westOverhang);
-      const maxX = halfW + WALL_THICKNESS + eastOverhang;
-      const spanX = maxX - minX;
-      if (spanX > 0.001) {
-        const soffitCenterZ = -(halfD + WALL_THICKNESS + southOverhang / 2);
-        lights.push(
-          { key: "south-1", position: [minX + spanX / 3, y, soffitCenterZ], targetY },
-          { key: "south-2", position: [minX + (spanX * 2) / 3, y, soffitCenterZ], targetY },
-        );
-      }
-    }
-
-    // North face soffit lights
-    if (northOverhang > 1.0) {
-      const minX = -(halfW + WALL_THICKNESS + westOverhang);
-      const maxX = halfW + WALL_THICKNESS + eastOverhang;
-      const spanX = maxX - minX;
-      if (spanX > 0.001) {
-        const soffitCenterZ = halfD + WALL_THICKNESS + northOverhang / 2;
-        lights.push(
-          { key: "north-1", position: [minX + spanX / 3, y, soffitCenterZ], targetY },
-          { key: "north-2", position: [minX + (spanX * 2) / 3, y, soffitCenterZ], targetY },
-        );
-      }
-    }
-
-    // East face soffit lights
-    if (eastOverhang > 1.0) {
-      const minZ = -(halfD + WALL_THICKNESS + southOverhang);
-      const maxZ = halfD + WALL_THICKNESS + northOverhang;
-      const spanZ = maxZ - minZ;
-      if (spanZ > 0.001) {
-        const soffitCenterX = halfW + WALL_THICKNESS + eastOverhang / 2;
-        lights.push(
-          { key: "east-1", position: [soffitCenterX, y, minZ + spanZ / 3], targetY },
-          { key: "east-2", position: [soffitCenterX, y, minZ + (spanZ * 2) / 3], targetY },
-        );
-      }
-    }
-
-    // West face soffit lights
-    if (westOverhang > 1.0) {
-      const minZ = -(halfD + WALL_THICKNESS + southOverhang);
-      const maxZ = halfD + WALL_THICKNESS + northOverhang;
-      const spanZ = maxZ - minZ;
-      if (spanZ > 0.001) {
-        const soffitCenterX = -(halfW + WALL_THICKNESS + westOverhang / 2);
-        lights.push(
-          { key: "west-1", position: [soffitCenterX, y, minZ + spanZ / 3], targetY },
-          { key: "west-2", position: [soffitCenterX, y, minZ + (spanZ * 2) / 3], targetY },
-        );
-      }
-    }
-
-    return lights;
-  }, [
-    height,
-    halfW,
-    halfD,
-    southOverhang,
-    northOverhang,
-    eastOverhang,
-    westOverhang,
-  ]);
-
   const resolvedDownlightIntensity = Math.max(
     0,
     Number.isFinite(downlightIntensity) ? downlightIntensity : 60,
@@ -2358,22 +2284,6 @@ function RoomModel({
             penumbra={resolvedDownlightPenumbra}
             sourceGlow={resolvedDownlightSourceGlow}
             roomHeight={height}
-          />
-        ))}
-
-        {/* External soffit downlights (when overhang has columns) */}
-        {externalSoffitDownlightLayout.map(({ key, position, targetY }) => (
-          <CeilingDownlight
-            key={`soffit-downlight-${key}`}
-            position={position}
-            downlightsOn={downlightsOn}
-            intensity={resolvedDownlightIntensity}
-            throwScale={resolvedDownlightThrowScale}
-            angle={resolvedDownlightAngle}
-            penumbra={resolvedDownlightPenumbra}
-            sourceGlow={resolvedDownlightSourceGlow}
-            roomHeight={height + BUILDING_LIFT}
-            targetY={targetY}
           />
         ))}
 
@@ -2917,7 +2827,6 @@ function CeilingDownlight({
   penumbra,
   sourceGlow,
   roomHeight,
-  targetY = 0,
 }) {
   const lightRef = useRef(null);
   const spillLightRef = useRef(null);
@@ -2935,7 +2844,7 @@ function CeilingDownlight({
     if (lights.length === 0) return;
     lights.forEach((light) => {
       light.parent?.add?.(light.target);
-      light.target.position.set(position[0], targetY, position[2]);
+      light.target.position.set(position[0], 0, position[2]);
       light.target.updateMatrixWorld();
     });
     return () => {
@@ -2943,7 +2852,7 @@ function CeilingDownlight({
         light.parent?.remove?.(light.target);
       });
     };
-  }, [position, targetY]);
+  }, [position]);
 
   return (
     <group>
