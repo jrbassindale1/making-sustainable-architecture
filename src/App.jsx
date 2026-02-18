@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { flushSync } from "react-dom";
 import {
   LineChart,
@@ -19,8 +27,12 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { InfoPopover } from "@/components/ui/info-popover";
 import { Vector3 } from "three";
-import { BuildingPreview } from "@/scene/BuildingPreview";
+import { BuildingPreviewLoader } from "@/components/BuildingPreviewLoader";
 import { drawOverlays, calculateLayout } from "@/export/OverlayRenderer";
+
+const BuildingPreview = lazy(() =>
+  import("@/scene/BuildingPreview").then((m) => ({ default: m.BuildingPreview }))
+);
 import {
   ACH_INFILTRATION_DEFAULT,
   BUILDING_DEPTH,
@@ -1388,36 +1400,38 @@ export default function App() {
               <>
                 <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.5fr)] lg:items-stretch">
                   <div data-export-model-panel className="flex h-full min-h-0 flex-col gap-4">
-                    <BuildingPreview
-                      faceConfigs={previewFaceConfigs}
-                      snapshot={snapshot}
-                      sunDirection={sunDirection}
-                      outdoorTemp={outdoorTemp}
-                      cloudCover={cloudCover}
-                      ventilationLabel={ventilationLabel}
-                      ventilationAch={achTotalAtTime}
-                      buildingWidth={buildingWidth}
-                      buildingDepth={buildingDepth}
-                      buildingHeight={buildingHeight}
-                      orientationDeg={orientationDeg}
-                      captureMode={exportingVideo}
-                      openWindowSegments={openWindowSegments}
-                      onToggleWindowSegment={toggleWindowSegment}
-                      onResizeWindowGlazing={handlePreviewFaceGlazingResize}
-                      rooflightSpec={rooflightSpec}
-                      rooflightEnabled={rooflightEnabled}
-                      onToggleRooflight={toggleRooflightOpen}
-                      downlightsOn={downlightsOn}
-                      downlightIntensity={downlightIntensity}
-                      downlightAngle={downlightBeamAngle}
-                      downlightPenumbra={downlightPenumbra}
-                      downlightThrowScale={downlightThrowScale}
-                      downlightSourceGlow={downlightSourceGlow}
-                      showMetrics={false}
-                      size="compact"
-                      stretch
-                      className="flex-1"
-                    />
+                    <Suspense fallback={<BuildingPreviewLoader size="compact" className="flex-1" />}>
+                      <BuildingPreview
+                        faceConfigs={previewFaceConfigs}
+                        snapshot={snapshot}
+                        sunDirection={sunDirection}
+                        outdoorTemp={outdoorTemp}
+                        cloudCover={cloudCover}
+                        ventilationLabel={ventilationLabel}
+                        ventilationAch={achTotalAtTime}
+                        buildingWidth={buildingWidth}
+                        buildingDepth={buildingDepth}
+                        buildingHeight={buildingHeight}
+                        orientationDeg={orientationDeg}
+                        captureMode={exportingVideo}
+                        openWindowSegments={openWindowSegments}
+                        onToggleWindowSegment={toggleWindowSegment}
+                        onResizeWindowGlazing={handlePreviewFaceGlazingResize}
+                        rooflightSpec={rooflightSpec}
+                        rooflightEnabled={rooflightEnabled}
+                        onToggleRooflight={toggleRooflightOpen}
+                        downlightsOn={downlightsOn}
+                        downlightIntensity={downlightIntensity}
+                        downlightAngle={downlightBeamAngle}
+                        downlightPenumbra={downlightPenumbra}
+                        downlightThrowScale={downlightThrowScale}
+                        downlightSourceGlow={downlightSourceGlow}
+                        showMetrics={false}
+                        size="compact"
+                        stretch
+                        className="flex-1"
+                      />
+                    </Suspense>
                   </div>
 
                   <div className="flex h-full min-h-0 flex-col gap-1">
@@ -1775,32 +1789,34 @@ export default function App() {
 
             {viewMode === "explain" && (
               <>
-                <BuildingPreview
-                  faceConfigs={previewFaceConfigs}
-                  snapshot={snapshot}
-                  sunDirection={sunDirection}
-                  outdoorTemp={outdoorTemp}
-                  cloudCover={cloudCover}
-                  ventilationLabel={ventilationLabel}
-                  ventilationAch={achTotalAtTime}
-                  buildingWidth={buildingWidth}
-                  buildingDepth={buildingDepth}
-                  buildingHeight={buildingHeight}
-                  orientationDeg={orientationDeg}
-                  captureMode={exportingVideo}
-                  openWindowSegments={openWindowSegments}
-                  onToggleWindowSegment={toggleWindowSegment}
-                  onResizeWindowGlazing={handlePreviewFaceGlazingResize}
-                  rooflightSpec={rooflightSpec}
-                  rooflightEnabled={rooflightEnabled}
-                  onToggleRooflight={toggleRooflightOpen}
-                  downlightsOn={downlightsOn}
-                  downlightIntensity={downlightIntensity}
-                  downlightAngle={downlightBeamAngle}
-                  downlightPenumbra={downlightPenumbra}
-                  downlightThrowScale={downlightThrowScale}
-                  downlightSourceGlow={downlightSourceGlow}
-                />
+                <Suspense fallback={<BuildingPreviewLoader />}>
+                  <BuildingPreview
+                    faceConfigs={previewFaceConfigs}
+                    snapshot={snapshot}
+                    sunDirection={sunDirection}
+                    outdoorTemp={outdoorTemp}
+                    cloudCover={cloudCover}
+                    ventilationLabel={ventilationLabel}
+                    ventilationAch={achTotalAtTime}
+                    buildingWidth={buildingWidth}
+                    buildingDepth={buildingDepth}
+                    buildingHeight={buildingHeight}
+                    orientationDeg={orientationDeg}
+                    captureMode={exportingVideo}
+                    openWindowSegments={openWindowSegments}
+                    onToggleWindowSegment={toggleWindowSegment}
+                    onResizeWindowGlazing={handlePreviewFaceGlazingResize}
+                    rooflightSpec={rooflightSpec}
+                    rooflightEnabled={rooflightEnabled}
+                    onToggleRooflight={toggleRooflightOpen}
+                    downlightsOn={downlightsOn}
+                    downlightIntensity={downlightIntensity}
+                    downlightAngle={downlightBeamAngle}
+                    downlightPenumbra={downlightPenumbra}
+                    downlightThrowScale={downlightThrowScale}
+                    downlightSourceGlow={downlightSourceGlow}
+                  />
+                </Suspense>
 
                 <InsightsCard
                   snapshot={snapshot}
