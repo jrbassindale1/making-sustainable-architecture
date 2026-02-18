@@ -44,6 +44,7 @@ import {
   U_VALUE_PRESET_ORDER,
   VENTILATION_PRESETS,
   VENTILATION_PRESET_ORDER,
+  WEATHER_FILE_URL,
   LUX_THRESHOLDS,
   MIN_WINDOW_CLEAR_HEIGHT,
   ROOFLIGHT_MAX_EDGE_OFFSET_M,
@@ -79,6 +80,7 @@ import {
   SPRING_EQUINOX_DAY,
   AUTUMN_EQUINOX_DAY,
 } from "@/engine";
+import { loadEpwDataset } from "@/weather/parseEpw";
 import {
   ComfortGuidanceCard,
   CostCarbonCard,
@@ -139,6 +141,9 @@ export default function App() {
   };
 
   const [orientationDeg, setOrientationDeg] = useState(0);
+  const [weatherMode, setWeatherMode] = useState("synthetic");
+  const [epwDataset, setEpwDataset] = useState(null);
+  const [epwLoadError, setEpwLoadError] = useState("");
   const [buildingWidth, setBuildingWidth] = useState(BUILDING_WIDTH);
   const [buildingDepth, setBuildingDepth] = useState(BUILDING_DEPTH);
   const [buildingHeight, setBuildingHeight] = useState(BUILDING_HEIGHT);
@@ -177,6 +182,26 @@ export default function App() {
     }
   }, [exportingVideo]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    loadEpwDataset(WEATHER_FILE_URL)
+      .then((dataset) => {
+        if (cancelled) return;
+        setEpwDataset(dataset);
+        setEpwLoadError("");
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn("[Weather] EPW load failed, synthetic weather remains active:", error);
+        setEpwLoadError(error?.message ?? "Unable to load EPW dataset.");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const faceFacingLabel = (face) => {
     const azimuth = normalizedAzimuth(face.azimuth + orientationDeg);
     const cardinal = cardinalFromAzimuth(azimuth);
@@ -185,12 +210,29 @@ export default function App() {
     return `${cardinalLabel} (${Math.round(azimuth)}°)`;
   };
 
-  const effectiveWeatherMode = "synthetic";
-  const weatherMeta = DEFAULT_SITE;
+  const epwAvailable = Boolean(epwDataset);
+  const epwLoading = !epwDataset && !epwLoadError;
+  const effectiveWeatherMode =
+    weatherMode === "epw" && epwAvailable ? "epw" : "synthetic";
+  const weatherMeta = useMemo(() => {
+    if (effectiveWeatherMode !== "epw" || !epwDataset?.meta) {
+      return DEFAULT_SITE;
+    }
+    return {
+      name: epwDataset.meta.name,
+      latitude: epwDataset.meta.lat,
+      longitude: epwDataset.meta.lon,
+      tzHours: epwDataset.meta.tzHours,
+      elevationM: epwDataset.meta.elevationM,
+    };
+  }, [effectiveWeatherMode, epwDataset]);
 
   const weatherSummary = useMemo(() => {
-    return "Simplified (Pencilli - Brecon)";
-  }, []);
+    if (effectiveWeatherMode === "epw") {
+      return `EPW weather (${weatherMeta.name})`;
+    }
+    return "Simplified synthetic (Pencelli - Brecon)";
+  }, [effectiveWeatherMode, weatherMeta.name]);
 
   const seasonalMarks = useMemo(() => {
     const isNorthern = weatherMeta.latitude >= 0;
@@ -207,8 +249,11 @@ export default function App() {
   }, [weatherMeta.latitude]);
 
   const weatherDescription = useMemo(() => {
-    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencilli - Brecon.";
-  }, []);
+    if (effectiveWeatherMode === "epw") {
+      return "Measured hourly dry-bulb, solar radiation, and cloud cover from the EPW file.";
+    }
+    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencelli - Brecon.";
+  }, [effectiveWeatherMode]);
 
   useEffect(() => {
     const node = dailyChartContainerRef.current;
@@ -562,10 +607,10 @@ export default function App() {
   const weatherProvider = useMemo(
     () => ({
       mode: effectiveWeatherMode,
-      dataset: null,
+      dataset: effectiveWeatherMode === "epw" ? epwDataset : null,
       syntheticProfile: SYNTHETIC_PROFILE,
     }),
-    [effectiveWeatherMode],
+    [effectiveWeatherMode, epwDataset],
   );
 
   const sunWindow = useMemo(
@@ -693,6 +738,10 @@ export default function App() {
       : perceivedComfortStatus === "cooling"
         ? "Above comfort"
         : "Within comfort";
+  const outdoorTemperatureInfoText =
+    effectiveWeatherMode === "epw"
+      ? "Outdoor temperature and cloud cover come from measured hourly EPW weather at this time."
+      : "Outdoor temperature follows a simplified seasonal/day profile and solar assumes clear-sky conditions.";
   const adaptiveReason = selectedPoint?.adaptiveReason;
   const baseVentilationLabel = adaptiveVentEnabled
     ? adaptiveReason === "day-cooling"
@@ -1488,7 +1537,7 @@ export default function App() {
                               heating or cooling would be needed.
                             </p>
                             <p className="mt-1">
-                              Outdoor temperature reflects the selected hour. Measured weather shows cloud cover; simplified mode assumes clear sky.
+                              {outdoorTemperatureInfoText}
                             </p>
                           </>
                         }
@@ -2121,16 +2170,49 @@ export default function App() {
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-xs font-medium text-slate-600">Weather source</p>
                           <div className="flex flex-col gap-2">
-                            <Button size="sm" variant="default" className="w-full justify-start" disabled>
-                              Simplified (Pencilli - Brecon)
+                            <Button
+                              size="sm"
+                              variant={weatherMode === "synthetic" ? "default" : "secondary"}
+                              className="w-full justify-start"
+                              onClick={() => setWeatherMode("synthetic")}
+                            >
+                              Simplified synthetic (default)
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant={weatherMode === "epw" ? "default" : "secondary"}
+                              className="w-full justify-start"
+                              onClick={() => setWeatherMode("epw")}
+                              disabled={!epwAvailable && !epwLoading}
+                            >
+                              {epwLoading
+                                ? "EPW measured weather (loading...)"
+                                : epwAvailable
+                                  ? "EPW measured weather"
+                                  : "EPW measured weather (unavailable)"}
                             </Button>
                           </div>
                           <p className="text-xs text-slate-600">{weatherDescription}</p>
-                          <p className="text-xs text-slate-500">
-                            Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
-                            swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
-                            useful for highlighting likely overheating and underheating periods.
-                          </p>
+                          {effectiveWeatherMode === "synthetic" ? (
+                            <p className="text-xs text-slate-500">
+                              Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
+                              swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
+                              useful for highlighting likely overheating and underheating periods.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-slate-500">
+                              EPW mode uses measured/typical-hourly weather (TMYx) for this location, so solar and
+                              outdoor temperature reflect cloud and seasonal conditions in the file.
+                            </p>
+                          )}
+                          {weatherMode === "epw" && effectiveWeatherMode !== "epw" && (
+                            <p className="text-xs text-amber-700">
+                              EPW is unavailable right now, so the model is running in synthetic mode.
+                            </p>
+                          )}
+                          {epwLoadError && (
+                            <p className="text-xs text-amber-700">{epwLoadError}</p>
+                          )}
                           <p className="text-xs text-slate-500">
                             {Math.abs(weatherMeta.latitude).toFixed(3)}°{weatherMeta.latitude >= 0 ? "N" : "S"},{" "}
                             {Math.abs(weatherMeta.longitude).toFixed(3)}°{weatherMeta.longitude >= 0 ? "E" : "W"} ·
