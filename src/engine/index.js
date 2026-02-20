@@ -300,11 +300,6 @@ export function calculateRoofPlanDimensions(dimensions = {}) {
   };
 }
 
-function clampRooflightEdgeInset(value, maxInset) {
-  const safe = Number.isFinite(value) ? value : ROOFLIGHT_MAX_EDGE_OFFSET_M;
-  return Math.max(ROOFLIGHT_MAX_EDGE_OFFSET_M, Math.min(safe, maxInset));
-}
-
 export function resolveRooflightConfig(rooflight = {}, dimensions = {}) {
   const insideParapetWidth = Number.isFinite(dimensions.width)
     ? dimensions.width
@@ -781,10 +776,44 @@ export function syntheticWindSpeedAt(dateLocal, profile = SYNTHETIC_PROFILE) {
   return Math.max(0.3, Math.min(12, windMS));
 }
 
+function syntheticRadiationAt(dateLocal, profile, totalSkyCover) {
+  const latitude = Number.isFinite(profile?.latitude) ? profile.latitude : SYNTHETIC_PROFILE.latitude;
+  const longitude = Number.isFinite(profile?.longitude) ? profile.longitude : SYNTHETIC_PROFILE.longitude;
+  const tzHours = Number.isFinite(profile?.tzHours) ? profile.tzHours : SYNTHETIC_PROFILE.tzHours;
+  const solarDateUtc = toSolarUtcDate(dateLocal, tzHours);
+  const { altitude } = solarPosition(solarDateUtc, latitude, longitude);
+  const clearSky = skyGroundComponents(altitude);
+  if (altitude <= 0) {
+    return { DNI: 0, DHI: 0, GHI: 0 };
+  }
+
+  const cloudTenths = Number.isFinite(totalSkyCover)
+    ? Math.max(0, Math.min(10, totalSkyCover))
+    : null;
+  if (cloudTenths === null) {
+    return {
+      DNI: safeRadiation(clearSky.DNI),
+      DHI: safeRadiation(clearSky.DHI),
+      GHI: safeRadiation(clearSky.GHI),
+    };
+  }
+
+  const cloudFraction = cloudTenths / 10;
+  const beamFactor = Math.max(0.08, 1 - 0.8 * cloudFraction ** 1.4);
+  const diffuseFactor = 0.65 + cloudFraction * 0.9;
+  const dni = safeRadiation(clearSky.DNI * beamFactor);
+  const dhi = safeRadiation(clearSky.DHI * diffuseFactor);
+  const ghi = safeRadiation(
+    dni * Math.max(0, Math.sin(deg2rad(altitude))) + dhi,
+  );
+  return { DNI: dni, DHI: dhi, GHI: ghi };
+}
+
 export function forcingAt(dateLocal, provider) {
+  const syntheticProfile = provider?.syntheticProfile || SYNTHETIC_PROFILE;
   const fallbackWindMS = syntheticWindSpeedAt(
     dateLocal,
-    provider?.syntheticProfile || SYNTHETIC_PROFILE,
+    syntheticProfile,
   );
   if (provider?.mode === "epw" && provider.dataset) {
     const epw = epwForcingAt(dateLocal, provider.dataset);
@@ -797,8 +826,30 @@ export function forcingAt(dateLocal, provider) {
     }
   }
 
-  const T_out = outdoorTemperatureAt(dateLocal, provider.syntheticProfile || SYNTHETIC_PROFILE);
-  return { T_out, windMS: fallbackWindMS, source: "synthetic" };
+  const T_out = outdoorTemperatureAt(dateLocal, syntheticProfile);
+  const syntheticSource =
+    typeof provider?.syntheticSource === "string" && provider.syntheticSource.length > 0
+      ? provider.syntheticSource
+      : "synthetic";
+  const totalSkyCover = Number.isFinite(provider?.totalSkyCover)
+    ? Math.max(0, Math.min(10, provider.totalSkyCover))
+    : Number.isFinite(syntheticProfile?.cloudCoverTenths)
+      ? Math.max(0, Math.min(10, syntheticProfile.cloudCoverTenths))
+      : undefined;
+  const relativeHumidity = Number.isFinite(provider?.relativeHumidity)
+    ? Math.max(0, Math.min(100, provider.relativeHumidity))
+    : Number.isFinite(syntheticProfile?.humidityPct)
+      ? Math.max(0, Math.min(100, syntheticProfile.humidityPct))
+      : undefined;
+  const syntheticRadiation = syntheticRadiationAt(dateLocal, syntheticProfile, totalSkyCover);
+  return {
+    T_out,
+    windMS: fallbackWindMS,
+    totalSkyCover,
+    relativeHumidity,
+    source: syntheticSource,
+    ...syntheticRadiation,
+  };
 }
 
 export function isNightHour(hour) {
@@ -1700,7 +1751,7 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       achTotal: vent.achTotal,
       heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
-        forcing.source === "epw"
+        Number.isFinite(forcing.DNI) || Number.isFinite(forcing.DHI) || Number.isFinite(forcing.GHI)
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }
           : undefined,
       T_room_override: indoorTemp,
@@ -1835,7 +1886,7 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
       achTotal: vent.achTotal,
       heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
-        forcing.source === "epw"
+        Number.isFinite(forcing.DNI) || Number.isFinite(forcing.DHI) || Number.isFinite(forcing.GHI)
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }
           : undefined,
       T_room_override: indoorTemp,

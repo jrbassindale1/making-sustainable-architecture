@@ -16,6 +16,7 @@ import {
 import { Card } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { InfoPopover } from "@/components/ui/info-popover";
 import { Vector3 } from "three";
@@ -38,7 +39,6 @@ import {
   SIMULATION_SPINUP_DAYS,
   SIMULATION_STEP_MINUTES,
   SUMMER_SOLSTICE_DAY,
-  SYNTHETIC_PROFILE,
   THERMAL_CAPACITANCE_J_PER_K,
   U_VALUE_PRESETS,
   U_VALUE_PRESET_ORDER,
@@ -81,6 +81,14 @@ import {
   AUTUMN_EQUINOX_DAY,
 } from "@/engine";
 import { loadEpwDataset } from "@/weather/parseEpw";
+import {
+  DEFAULT_MANUAL_WEATHER,
+  buildManualProfileFromLocation,
+  clampLatitude,
+  estimateTimezoneFromLongitude,
+  inferClimatologyFromLocation,
+  normalizeLongitude,
+} from "@/weather/locationClimate";
 import {
   ComfortGuidanceCard,
   CostCarbonCard,
@@ -160,7 +168,16 @@ export default function App() {
   };
 
   const [orientationDeg, setOrientationDeg] = useState(0);
-  const [weatherMode, setWeatherMode] = useState("synthetic");
+  const [weatherMode, setWeatherMode] = useState("climatology");
+  const [locationMeta, setLocationMeta] = useState({
+    name: DEFAULT_SITE.name,
+    latitude: DEFAULT_SITE.latitude,
+    longitude: DEFAULT_SITE.longitude,
+    tzHours: DEFAULT_SITE.tzHours,
+    elevationM: DEFAULT_SITE.elevationM,
+  });
+  const [autoTimezone, setAutoTimezone] = useState(true);
+  const [manualWeather, setManualWeather] = useState(DEFAULT_MANUAL_WEATHER);
   const [epwDataset, setEpwDataset] = useState(null);
   const [epwLoadError, setEpwLoadError] = useState("");
   const [buildingWidth, setBuildingWidth] = useState(BUILDING_WIDTH);
@@ -208,7 +225,7 @@ export default function App() {
     trackAnalyticsEvent("app_loaded", {
       app_area: "room_comfort_sim",
       initial_view_mode: "explore",
-      initial_weather_mode: "synthetic",
+      initial_weather_mode: "climatology",
     });
   }, [trackAnalyticsEvent]);
 
@@ -234,7 +251,7 @@ export default function App() {
       })
       .catch((error) => {
         if (cancelled) return;
-        console.warn("[Weather] EPW load failed, synthetic weather remains active:", error);
+        console.warn("[Weather] EPW load failed, climatology weather remains active:", error);
         setEpwLoadError(error?.message ?? "Unable to load EPW dataset.");
         trackAnalyticsEvent("weather_epw_load_failed", {
           error_message: getAnalyticsErrorMessage(error).slice(0, 120),
@@ -257,7 +274,37 @@ export default function App() {
   const epwAvailable = Boolean(epwDataset);
   const epwLoading = !epwDataset && !epwLoadError;
   const effectiveWeatherMode =
-    weatherMode === "epw" && epwAvailable ? "epw" : "synthetic";
+    weatherMode === "epw" && epwAvailable
+      ? "epw"
+      : weatherMode === "epw"
+        ? "climatology"
+        : weatherMode;
+  const normalizedLocation = useMemo(() => {
+    const latitude = clampLatitude(locationMeta.latitude);
+    const longitude = normalizeLongitude(locationMeta.longitude);
+    const tzHours = autoTimezone
+      ? estimateTimezoneFromLongitude(longitude)
+      : Math.max(-12, Math.min(14, Math.round(locationMeta.tzHours)));
+    const elevationM = Math.max(
+      0,
+      Number.isFinite(locationMeta.elevationM) ? locationMeta.elevationM : 0,
+    );
+    return {
+      name: locationMeta.name || "Custom location",
+      latitude,
+      longitude,
+      tzHours,
+      elevationM,
+    };
+  }, [autoTimezone, locationMeta]);
+  const climatologyProfile = useMemo(
+    () => inferClimatologyFromLocation(normalizedLocation),
+    [normalizedLocation],
+  );
+  const manualProfile = useMemo(
+    () => buildManualProfileFromLocation(normalizedLocation, manualWeather),
+    [manualWeather, normalizedLocation],
+  );
   const buildAnalyticsContext = useCallback(
     () => ({
       view_mode: viewMode,
@@ -283,23 +330,28 @@ export default function App() {
     ],
   );
   const weatherMeta = useMemo(() => {
-    if (effectiveWeatherMode !== "epw" || !epwDataset?.meta) {
-      return DEFAULT_SITE;
+    if (effectiveWeatherMode === "epw" && epwDataset?.meta) {
+      return {
+        name: epwDataset.meta.name,
+        latitude: epwDataset.meta.lat,
+        longitude: epwDataset.meta.lon,
+        tzHours: epwDataset.meta.tzHours,
+        elevationM: epwDataset.meta.elevationM,
+      };
     }
     return {
-      name: epwDataset.meta.name,
-      latitude: epwDataset.meta.lat,
-      longitude: epwDataset.meta.lon,
-      tzHours: epwDataset.meta.tzHours,
-      elevationM: epwDataset.meta.elevationM,
+      ...normalizedLocation,
     };
-  }, [effectiveWeatherMode, epwDataset]);
+  }, [effectiveWeatherMode, epwDataset, normalizedLocation]);
 
   const weatherSummary = useMemo(() => {
     if (effectiveWeatherMode === "epw") {
       return `EPW weather (${weatherMeta.name})`;
     }
-    return "Simplified synthetic (Pencelli - Brecon)";
+    if (effectiveWeatherMode === "manual") {
+      return `Manual weather (${weatherMeta.name})`;
+    }
+    return `Global climatology (${weatherMeta.name})`;
   }, [effectiveWeatherMode, weatherMeta.name]);
 
   const seasonalMarks = useMemo(() => {
@@ -320,7 +372,10 @@ export default function App() {
     if (effectiveWeatherMode === "epw") {
       return "Measured hourly dry-bulb, solar radiation, and cloud cover from the EPW file.";
     }
-    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencelli - Brecon.";
+    if (effectiveWeatherMode === "manual") {
+      return "User-defined seasonal temperatures, cloud cover, humidity, and wind are applied at this location.";
+    }
+    return "Location-based climatology estimate (seasonal temperature, cloud, humidity, and wind) plus solar geometry from latitude/longitude.";
   }, [effectiveWeatherMode]);
 
   useEffect(() => {
@@ -712,14 +767,44 @@ export default function App() {
     () => ({ ...baseParamsTemplate, windows }),
     [baseParamsTemplate, windows],
   );
+  const epwFallbackProfile = useMemo(() => {
+    if (!epwDataset?.meta) return climatologyProfile;
+    return inferClimatologyFromLocation({
+      name: epwDataset.meta.name,
+      latitude: epwDataset.meta.lat,
+      longitude: epwDataset.meta.lon,
+      tzHours: epwDataset.meta.tzHours,
+      elevationM: epwDataset.meta.elevationM,
+    });
+  }, [climatologyProfile, epwDataset]);
 
   const weatherProvider = useMemo(
     () => ({
-      mode: effectiveWeatherMode,
+      mode: effectiveWeatherMode === "epw" ? "epw" : "synthetic",
       dataset: effectiveWeatherMode === "epw" ? epwDataset : null,
-      syntheticProfile: SYNTHETIC_PROFILE,
+      syntheticProfile:
+        effectiveWeatherMode === "epw"
+          ? epwFallbackProfile
+          : effectiveWeatherMode === "manual"
+            ? manualProfile
+            : climatologyProfile,
+      syntheticSource: effectiveWeatherMode === "manual" ? "manual" : "climatology",
+      totalSkyCover:
+        effectiveWeatherMode === "manual"
+          ? manualProfile.cloudCoverTenths
+          : climatologyProfile.cloudCoverTenths,
+      relativeHumidity:
+        effectiveWeatherMode === "manual"
+          ? manualProfile.humidityPct
+          : climatologyProfile.humidityPct,
     }),
-    [effectiveWeatherMode, epwDataset],
+    [
+      climatologyProfile,
+      effectiveWeatherMode,
+      epwDataset,
+      epwFallbackProfile,
+      manualProfile,
+    ],
   );
 
   const sunWindow = useMemo(
@@ -778,7 +863,7 @@ export default function App() {
     [dateAtTime, weatherProvider],
   );
   const outdoorTemp = currentForcing.T_out;
-  const cloudCover = currentForcing.totalSkyCover; // tenths (0-10), undefined if synthetic
+  const cloudCover = currentForcing.totalSkyCover; // tenths (0-10), optional
   const indoorTempAtTime = selectedPoint?.T_in ?? outdoorTemp;
   const manualWindowVentilation = useMemo(
     () =>
@@ -853,7 +938,9 @@ export default function App() {
   const outdoorTemperatureInfoText =
     effectiveWeatherMode === "epw"
       ? "Outdoor temperature and cloud cover come from measured hourly EPW weather at this time."
-      : "Outdoor temperature follows a simplified seasonal/day profile and solar assumes clear-sky conditions.";
+      : effectiveWeatherMode === "manual"
+        ? "Outdoor temperature, cloud cover, and wind come from your manual weather override at this location."
+        : "Outdoor temperature, cloud cover, and wind come from a location-based climatology estimate.";
   const adaptiveReason = selectedPoint?.adaptiveReason;
   const baseVentilationLabel = adaptiveVentEnabled
     ? adaptiveReason === "day-cooling"
@@ -891,7 +978,9 @@ export default function App() {
       achTotal: achTotalAtTime,
       heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
-        currentForcing.source === "epw"
+        Number.isFinite(currentForcing.DNI) ||
+        Number.isFinite(currentForcing.DHI) ||
+        Number.isFinite(currentForcing.GHI)
           ? { DNI: currentForcing.DNI, DHI: currentForcing.DHI, GHI: currentForcing.GHI }
           : undefined,
       T_room_override: indoorTempOverride,
@@ -1595,6 +1684,82 @@ export default function App() {
       to_tab: nextTabId,
     });
   }, [exploreTab, trackAnalyticsEvent]);
+  const updateLocationCoordinates = useCallback((latitude, longitude, source = "input") => {
+    const nextLatitude = clampLatitude(latitude);
+    const nextLongitude = normalizeLongitude(longitude);
+    const nextTzHours = autoTimezone
+      ? estimateTimezoneFromLongitude(nextLongitude)
+      : undefined;
+    setLocationMeta((prev) => ({
+      ...prev,
+      name: "Custom location",
+      latitude: nextLatitude,
+      longitude: nextLongitude,
+      tzHours: nextTzHours ?? prev.tzHours,
+    }));
+    if (source === "map") {
+      trackAnalyticsEvent("location_selected_from_map", {
+        latitude: Number(nextLatitude.toFixed(3)),
+        longitude: Number(nextLongitude.toFixed(3)),
+      });
+    }
+  }, [autoTimezone, trackAnalyticsEvent]);
+  const handleLocationMapClick = useCallback((event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = Math.min(Math.max(0, event.clientX - rect.left), rect.width);
+    const y = Math.min(Math.max(0, event.clientY - rect.top), rect.height);
+    const longitude = (x / rect.width) * 360 - 180;
+    const latitude = 90 - (y / rect.height) * 180;
+    updateLocationCoordinates(latitude, longitude, "map");
+  }, [updateLocationCoordinates]);
+  const handleLatitudeChange = useCallback((value) => {
+    if (!Number.isFinite(value)) return;
+    updateLocationCoordinates(value, normalizedLocation.longitude);
+  }, [normalizedLocation.longitude, updateLocationCoordinates]);
+  const handleLongitudeChange = useCallback((value) => {
+    if (!Number.isFinite(value)) return;
+    updateLocationCoordinates(normalizedLocation.latitude, value);
+  }, [normalizedLocation.latitude, updateLocationCoordinates]);
+  const handleElevationChange = useCallback((value) => {
+    if (!Number.isFinite(value)) return;
+    setLocationMeta((prev) => ({
+      ...prev,
+      elevationM: Math.max(0, value),
+    }));
+  }, []);
+  const handleTimezoneChange = useCallback((value) => {
+    if (!Number.isFinite(value)) return;
+    setLocationMeta((prev) => ({
+      ...prev,
+      tzHours: Math.max(-12, Math.min(14, Math.round(value))),
+    }));
+  }, []);
+  const handleAutoTimezoneChange = useCallback((enabled) => {
+    setAutoTimezone(enabled);
+    if (!enabled) return;
+    setLocationMeta((prev) => ({
+      ...prev,
+      tzHours: estimateTimezoneFromLongitude(normalizeLongitude(prev.longitude)),
+    }));
+  }, []);
+  const handleManualWeatherChange = useCallback((field, value) => {
+    if (!Number.isFinite(value)) return;
+    setManualWeather((prev) => {
+      if (field === "summerTempC") {
+        const nextSummer = Math.max(value, prev.winterTempC + 0.5);
+        return { ...prev, summerTempC: nextSummer };
+      }
+      if (field === "winterTempC") {
+        const nextWinter = Math.min(value, prev.summerTempC - 0.5);
+        return { ...prev, winterTempC: nextWinter };
+      }
+      return {
+        ...prev,
+        [field]: value,
+      };
+    });
+  }, []);
   const handleWeatherModeChange = useCallback((nextWeatherMode) => {
     if (weatherMode === nextWeatherMode) return;
     setWeatherMode(nextWeatherMode);
@@ -1659,6 +1824,10 @@ export default function App() {
       resulting_ventilation_preset: "background",
     });
   }, [buildAnalyticsContext, openWindowSegments, rooflightState.openHeight, trackAnalyticsEvent]);
+  const locationMarkerStyle = useMemo(() => ({
+    left: `${((normalizedLocation.longitude + 180) / 360) * 100}%`,
+    top: `${((90 - normalizedLocation.latitude) / 180) * 100}%`,
+  }), [normalizedLocation.latitude, normalizedLocation.longitude]);
 
   return (
     <div className="relative min-h-screen bg-[#f5f3ee] lg:h-[100svh] lg:overflow-hidden">
@@ -2444,15 +2613,110 @@ export default function App() {
                     {exploreTab === "context" && (
                       <div className="space-y-2">
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-xs font-medium text-slate-600">Location</p>
+                          <p className="text-xs text-slate-500">
+                            Click the mini world map or type coordinates. The simulation then reuses the same room
+                            model with weather estimated for that location.
+                          </p>
+                          <button
+                            type="button"
+                            className="relative block aspect-[2/1] w-full overflow-hidden rounded-md border border-slate-200 bg-[linear-gradient(180deg,#d9efff_0%,#eaf6ff_35%,#d6ecf8_100%)]"
+                            onClick={handleLocationMapClick}
+                          >
+                            <svg
+                              viewBox="0 0 360 180"
+                              aria-hidden="true"
+                              className="absolute inset-0 h-full w-full"
+                            >
+                              <g fill="#a7c6a1" opacity="0.95">
+                                <path d="M22 74l24-19 35-1 26 10 8 16-14 15-32 2-15 19-16-7-10-20z" />
+                                <path d="M120 53l19-10 31 2 21 18-6 22-24 18-30-3-10-16z" />
+                                <path d="M155 112l19 6 10 18-6 26-18 8-14-13 2-20z" />
+                                <path d="M198 61l24-8 30 8 26 18-8 18-34 7-24 1-14-15z" />
+                                <path d="M244 105l18 8 22 2 14 10-3 20-19 12-28-8-10-24z" />
+                                <path d="M286 52l18-12 26 1 17 10-2 16-16 10-26-4z" />
+                                <path d="M307 98l20 4 11 13-7 16-17 5-13-9z" />
+                              </g>
+                              <g stroke="#8bb6ce" strokeWidth="1" opacity="0.6">
+                                <path d="M0 45h360M0 90h360M0 135h360M90 0v180M180 0v180M270 0v180" />
+                              </g>
+                            </svg>
+                            <span
+                              className="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-rose-600 shadow"
+                              style={locationMarkerStyle}
+                              aria-hidden="true"
+                            />
+                          </button>
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-medium text-slate-600">Latitude</span>
+                              <Input
+                                type="number"
+                                value={normalizedLocation.latitude}
+                                min={-90}
+                                max={90}
+                                step={0.1}
+                                onChange={(event) => handleLatitudeChange(Number.parseFloat(event.target.value))}
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-medium text-slate-600">Longitude</span>
+                              <Input
+                                type="number"
+                                value={normalizedLocation.longitude}
+                                min={-180}
+                                max={180}
+                                step={0.1}
+                                onChange={(event) => handleLongitudeChange(Number.parseFloat(event.target.value))}
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-medium text-slate-600">Elevation (m)</span>
+                              <Input
+                                type="number"
+                                value={Math.round(normalizedLocation.elevationM)}
+                                min={0}
+                                max={6000}
+                                step={10}
+                                onChange={(event) => handleElevationChange(Number.parseFloat(event.target.value))}
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-medium text-slate-600">Timezone (UTC)</span>
+                              <Input
+                                type="number"
+                                value={normalizedLocation.tzHours}
+                                min={-12}
+                                max={14}
+                                step={1}
+                                disabled={autoTimezone}
+                                onChange={(event) => handleTimezoneChange(Number.parseFloat(event.target.value))}
+                              />
+                            </label>
+                          </div>
+                          <div className="flex items-center justify-between rounded-md border border-slate-200 px-2 py-1.5">
+                            <p className="text-[11px] text-slate-600">Auto timezone from longitude</p>
+                            <Switch checked={autoTimezone} onCheckedChange={handleAutoTimezoneChange} />
+                          </div>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-xs font-medium text-slate-600">Weather source</p>
                           <div className="flex flex-col gap-2">
                             <Button
                               size="sm"
-                              variant={weatherMode === "synthetic" ? "default" : "secondary"}
+                              variant={weatherMode === "climatology" ? "default" : "secondary"}
                               className="w-full justify-start"
-                              onClick={() => handleWeatherModeChange("synthetic")}
+                              onClick={() => handleWeatherModeChange("climatology")}
                             >
-                              Simplified synthetic (default)
+                              Global climatology estimate
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant={weatherMode === "manual" ? "default" : "secondary"}
+                              className="w-full justify-start"
+                              onClick={() => handleWeatherModeChange("manual")}
+                            >
+                              Manual weather override
                             </Button>
                             <Button
                               size="sm"
@@ -2464,26 +2728,104 @@ export default function App() {
                               {epwLoading
                                 ? "EPW measured weather (loading...)"
                                 : epwAvailable
-                                  ? "EPW measured weather"
+                                  ? "EPW measured weather (fixed file)"
                                   : "EPW measured weather (unavailable)"}
                             </Button>
                           </div>
                           <p className="text-xs text-slate-600">{weatherDescription}</p>
-                          {effectiveWeatherMode === "synthetic" ? (
+                          {effectiveWeatherMode === "climatology" && (
                             <p className="text-xs text-slate-500">
-                              Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
-                              swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
-                              useful for highlighting likely overheating and underheating periods.
+                              Estimated profile at this location: summer {climatologyProfile.temps.summer.toFixed(1)}°C,
+                              winter {climatologyProfile.temps.winter.toFixed(1)}°C, diurnal swing{" "}
+                              {climatologyProfile.diurnalRange.toFixed(1)}°C, mean wind{" "}
+                              {climatologyProfile.meanWindMS.toFixed(1)} m/s.
                             </p>
-                          ) : (
-                            <p className="text-xs text-slate-500">
-                              EPW mode uses measured/typical-hourly weather (TMYx) for this location, so solar and
-                              outdoor temperature reflect cloud and seasonal conditions in the file.
-                            </p>
+                          )}
+                          {effectiveWeatherMode === "manual" && (
+                            <div className="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-2">
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Summer peak temperature</span>
+                                  <span>{manualWeather.summerTempC.toFixed(1)}°C</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.summerTempC]}
+                                  min={-10}
+                                  max={45}
+                                  step={0.5}
+                                  onValueChange={(values) => handleManualWeatherChange("summerTempC", values[0])}
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Winter peak temperature</span>
+                                  <span>{manualWeather.winterTempC.toFixed(1)}°C</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.winterTempC]}
+                                  min={-25}
+                                  max={25}
+                                  step={0.5}
+                                  onValueChange={(values) => handleManualWeatherChange("winterTempC", values[0])}
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Day-night swing</span>
+                                  <span>{manualWeather.diurnalRangeC.toFixed(1)}°C</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.diurnalRangeC]}
+                                  min={2}
+                                  max={20}
+                                  step={0.5}
+                                  onValueChange={(values) => handleManualWeatherChange("diurnalRangeC", values[0])}
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Mean wind speed</span>
+                                  <span>{manualWeather.meanWindMS.toFixed(1)} m/s</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.meanWindMS]}
+                                  min={0}
+                                  max={12}
+                                  step={0.1}
+                                  onValueChange={(values) => handleManualWeatherChange("meanWindMS", values[0])}
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Cloud cover</span>
+                                  <span>{manualWeather.cloudCoverTenths.toFixed(1)} / 10</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.cloudCoverTenths]}
+                                  min={0}
+                                  max={10}
+                                  step={0.1}
+                                  onValueChange={(values) => handleManualWeatherChange("cloudCoverTenths", values[0])}
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px] text-slate-600">
+                                  <span>Relative humidity</span>
+                                  <span>{manualWeather.humidityPct.toFixed(0)}%</span>
+                                </div>
+                                <Slider
+                                  value={[manualWeather.humidityPct]}
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  onValueChange={(values) => handleManualWeatherChange("humidityPct", values[0])}
+                                />
+                              </div>
+                            </div>
                           )}
                           {weatherMode === "epw" && effectiveWeatherMode !== "epw" && (
                             <p className="text-xs text-amber-700">
-                              EPW is unavailable right now, so the model is running in synthetic mode.
+                              EPW is unavailable right now, so the model is running in global climatology mode.
                             </p>
                           )}
                           {epwLoadError && (
