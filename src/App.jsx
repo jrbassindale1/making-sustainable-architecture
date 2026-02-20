@@ -21,6 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import { InfoPopover } from "@/components/ui/info-popover";
 import { Vector3 } from "three";
 import { BuildingPreview } from "@/scene/BuildingPreview";
+import { LocationMapPicker } from "@/components/LocationMapPicker";
 import { drawOverlays, calculateLayout } from "@/export/OverlayRenderer";
 import {
   ACH_INFILTRATION_DEFAULT,
@@ -1704,13 +1705,7 @@ export default function App() {
       });
     }
   }, [autoTimezone, trackAnalyticsEvent]);
-  const handleLocationMapClick = useCallback((event) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const x = Math.min(Math.max(0, event.clientX - rect.left), rect.width);
-    const y = Math.min(Math.max(0, event.clientY - rect.top), rect.height);
-    const longitude = (x / rect.width) * 360 - 180;
-    const latitude = 90 - (y / rect.height) * 180;
+  const handleLocationMapSelect = useCallback(({ latitude, longitude }) => {
     updateLocationCoordinates(latitude, longitude, "map");
   }, [updateLocationCoordinates]);
   const handleLatitudeChange = useCallback((value) => {
@@ -1824,11 +1819,6 @@ export default function App() {
       resulting_ventilation_preset: "background",
     });
   }, [buildAnalyticsContext, openWindowSegments, rooflightState.openHeight, trackAnalyticsEvent]);
-  const locationMarkerStyle = useMemo(() => ({
-    left: `${((normalizedLocation.longitude + 180) / 360) * 100}%`,
-    top: `${((90 - normalizedLocation.latitude) / 180) * 100}%`,
-  }), [normalizedLocation.latitude, normalizedLocation.longitude]);
-
   return (
     <div className="relative min-h-screen bg-[#f5f3ee] lg:h-[100svh] lg:overflow-hidden">
       <div className="pointer-events-none absolute inset-0 opacity-[0.35] [background-image:linear-gradient(to_right,rgba(15,23,42,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(15,23,42,0.08)_1px,transparent_1px)] [background-size:24px_24px]" />
@@ -2618,35 +2608,11 @@ export default function App() {
                             Click the mini world map or type coordinates. The simulation then reuses the same room
                             model with weather estimated for that location.
                           </p>
-                          <button
-                            type="button"
-                            className="relative block aspect-[2/1] w-full overflow-hidden rounded-md border border-slate-200 bg-[linear-gradient(180deg,#d9efff_0%,#eaf6ff_35%,#d6ecf8_100%)]"
-                            onClick={handleLocationMapClick}
-                          >
-                            <svg
-                              viewBox="0 0 360 180"
-                              aria-hidden="true"
-                              className="absolute inset-0 h-full w-full"
-                            >
-                              <g fill="#a7c6a1" opacity="0.95">
-                                <path d="M22 74l24-19 35-1 26 10 8 16-14 15-32 2-15 19-16-7-10-20z" />
-                                <path d="M120 53l19-10 31 2 21 18-6 22-24 18-30-3-10-16z" />
-                                <path d="M155 112l19 6 10 18-6 26-18 8-14-13 2-20z" />
-                                <path d="M198 61l24-8 30 8 26 18-8 18-34 7-24 1-14-15z" />
-                                <path d="M244 105l18 8 22 2 14 10-3 20-19 12-28-8-10-24z" />
-                                <path d="M286 52l18-12 26 1 17 10-2 16-16 10-26-4z" />
-                                <path d="M307 98l20 4 11 13-7 16-17 5-13-9z" />
-                              </g>
-                              <g stroke="#8bb6ce" strokeWidth="1" opacity="0.6">
-                                <path d="M0 45h360M0 90h360M0 135h360M90 0v180M180 0v180M270 0v180" />
-                              </g>
-                            </svg>
-                            <span
-                              className="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-rose-600 shadow"
-                              style={locationMarkerStyle}
-                              aria-hidden="true"
-                            />
-                          </button>
+                          <LocationMapPicker
+                            latitude={normalizedLocation.latitude}
+                            longitude={normalizedLocation.longitude}
+                            onSelect={handleLocationMapSelect}
+                          />
                           <div className="grid grid-cols-2 gap-2">
                             <label className="space-y-1">
                               <span className="text-[11px] font-medium text-slate-600">Latitude</span>
