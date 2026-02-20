@@ -1,6 +1,6 @@
 # Room Comfort Simulator Assumptions
 
-Last updated: February 18, 2026.
+Last updated: February 19, 2026.
 
 ## 1) Scope and intended use
 
@@ -79,9 +79,19 @@ Current ACH uses a simple preset (constant across the day by default):
 - Presets (total ACH):
   - Background only: `0.3 ACH`
   - Trickle vents: `0.6 ACH`
+  - MVHR (Passivhaus-style): `0.4 ACH` with `85%` heat recovery efficiency (continuous balanced ventilation for well-sealed envelope)
   - Open windows: `3.0 ACH`
   - Purge: `6.0 ACH`
   - Adaptive: scales between `0.6` and `6.0 ACH` when indoor temperature is above comfort and outdoor air is beneficial.
+
+Heat recovery modeling:
+
+- MVHR heat recovery reduces ventilation heat loss by the efficiency factor (default `85%`).
+- Heat recovery is automatically disabled when window-based ventilation is active:
+  - Adaptive ventilation mode (windows open automatically)
+  - Manual window openings
+  - Night purge mode (22:00-06:00)
+- This reflects that heat recovery only applies to air passing through the mechanical heat exchanger, not to bypass airflows through windows.
 
 Optional night purge:
 
@@ -98,6 +108,7 @@ Optional night purge:
   - Baseline - Building Regs 2025: walls `0.35`, roof `0.20`, floor `0.25`, windows `1.10` W/m2K.
   - 25% Above Baseline: walls `0.25`, roof `0.15`, floor `0.20`, windows `0.90` W/m2K.
   - High-performance (default): walls `0.15`, roof `0.15`, floor `0.15`, windows `0.70` W/m2K.
+  - Passivhaus (indicative): walls `0.10`, roof `0.10`, floor `0.10`, windows `0.80` W/m2K.
 - Solar transmittance (`g_glass`): `0.40` (low-E glazing; typical range 0.3-0.5).
 - Internal sensible gains: `180 W` constant.
 - Ground albedo: `0.25`.
@@ -106,13 +117,20 @@ Optional night purge:
   - `c_p,air = 1006 J/(kg*K)`
 - Ventilation defaults:
   - Background-only preset: `0.3 ACH` total (infiltration only).
-  - Preset options: `0.3 / 0.6 / 3.0 / 6.0 ACH` total (+ adaptive `0.6-6.0 ACH`).
+  - Preset options: `0.3 / 0.4 / 0.6 / 3.0 / 6.0 ACH` total (+ adaptive `0.6-6.0 ACH`).
   - Manual window/rooflight opening airflow in the app uses a fixed southwest wind assumption (`5 mph`) for consistency in the UI.
 - 1R1C thermal capacitance: `6.0 MJ/K` (single lumped node).
 - Numerical integration step: `10 minutes`.
-- Spin-up period before reporting a day: `7 days` by default (adjustable via “Balanced out”).
+- Spin-up period before reporting a day: `7 days` by default (adjustable via "Balanced out").
 - Start indoor temperature: auto (matches outdoor at spin-up start).
 - Annual reporting run: `8760` hourly steps (typical year view).
+- Passivhaus override (indicative): one-click preset for Passivhaus-style design comparison:
+  - Applies Passivhaus fabric and MVHR ventilation presets (see above).
+  - Enables night purge (`22:00-06:00` at `6.0 ACH`). Note: heat recovery is disabled during night purge hours as this represents window-based ventilation, not MVHR bypass.
+  - Sets facade glazing: North `16%`, East `18%`, South `34%`, West `18%`.
+  - Sets shading: South overhang `0.9` + horizontal fin `0.45`; East/West vertical fins only `0.5` (overhangs ineffective for low-angle sun).
+  - Closes all manual window openings and disables rooflight.
+  - Orientation is not changed (user-controlled).
 - Site metadata from EPW LOCATION:
   - Latitude: `51.917`
   - Longitude: `-3.317` (east positive / west negative)

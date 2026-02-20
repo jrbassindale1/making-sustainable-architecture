@@ -55,8 +55,18 @@ export const U_VALUE_PRESETS = {
       window: 0.7,
     },
   },
+  passivhaus: {
+    label: "Passivhaus (indicative)",
+    detail: "Indicative Passivhaus-style fabric values for early-stage option testing (not certification).",
+    values: {
+      wall: 0.1,
+      roof: 0.1,
+      floor: 0.1,
+      window: 0.8,
+    },
+  },
 };
-export const U_VALUE_PRESET_ORDER = ["baseline", "improved", "high"];
+export const U_VALUE_PRESET_ORDER = ["baseline", "improved", "high", "passivhaus"];
 export const DEFAULT_U_VALUE_PRESET = "high";
 
 export const MODEL_YEAR = 2025;
@@ -85,6 +95,12 @@ export const VENTILATION_PRESETS = {
     detail: "Low, steady ventilation.",
     achTotal: 0.6,
   },
+  passivhaus: {
+    label: "MVHR (Passivhaus-style)",
+    detail: "Indicative continuous balanced ventilation for a well-sealed envelope with heat recovery.",
+    achTotal: 0.4,
+    heatRecoveryEfficiency: 0.85,
+  },
   open: {
     label: "Open windows",
     detail: "Typical daytime opening.",
@@ -102,7 +118,7 @@ export const VENTILATION_PRESETS = {
     isAdaptive: true,
   },
 };
-export const VENTILATION_PRESET_ORDER = ["background", "trickle", "open", "adaptive"];
+export const VENTILATION_PRESET_ORDER = ["background", "trickle", "passivhaus", "open", "adaptive"];
 export const DEFAULT_VENTILATION_PRESET = "background";
 export const MAX_VENTILATION_ACH = Math.max(
   ...Object.values(VENTILATION_PRESETS).map((preset) => preset.achTotal),
@@ -1410,6 +1426,7 @@ export function computeSnapshot(params) {
     blindsReduction,
     g_glass,
     achTotal = ACH_INFILTRATION_DEFAULT,
+    heatRecoveryEfficiency = 0,
     T_out,
     Q_internal,
     latitude,
@@ -1423,7 +1440,8 @@ export function computeSnapshot(params) {
   } = params;
 
   const volume = width * depth * height;
-  const UA_vent = (RHO_AIR * CP_AIR * achTotal * volume) / 3600;
+  const hrEff = Math.max(0, Math.min(1, heatRecoveryEfficiency || 0));
+  const UA_vent = ((RHO_AIR * CP_AIR * achTotal * volume) / 3600) * (1 - hrEff);
 
   const solarDateUtc = toSolarUtcDate(dateMidday, timezoneHours);
   const { altitude, azimuth } = solarPosition(solarDateUtc, latitude, longitude);
@@ -1607,6 +1625,7 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
   const thermalCapacitance = options.thermalCapacitance ?? THERMAL_CAPACITANCE_J_PER_K;
   const comfortBand = options.comfortBand ?? COMFORT_BAND;
   const achTotalPreset = options.achTotal ?? ACH_INFILTRATION_DEFAULT;
+  const heatRecoveryEfficiencyPreset = options.heatRecoveryEfficiency ?? 0;
   const manualOpenAchFixed = Math.max(0, options.manualOpenAch ?? 0);
   const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
@@ -1668,11 +1687,18 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       );
     }
 
+    // Heat recovery only applies to mechanical ventilation, not window-based ventilation
+    // Disable HR when: adaptive mode, manual windows open, or night purge active
+    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
+    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+
     const snapshot = computeSnapshot({
       ...params,
       dateMidday: time,
       T_out: forcing.T_out,
       achTotal: vent.achTotal,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         forcing.source === "epw"
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }
@@ -1742,6 +1768,7 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
   const comfortBand = options.comfortBand ?? COMFORT_BAND;
   const thermalCapacitance = options.thermalCapacitance ?? THERMAL_CAPACITANCE_J_PER_K;
   const achTotalPreset = options.achTotal ?? ACH_INFILTRATION_DEFAULT;
+  const heatRecoveryEfficiencyPreset = options.heatRecoveryEfficiency ?? 0;
   const manualOpenAchFixed = Math.max(0, options.manualOpenAch ?? 0);
   const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
@@ -1794,11 +1821,19 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
       manualOpenAch,
       manualVentilation: manualVent,
     };
+
+    // Heat recovery only applies to mechanical ventilation, not window-based ventilation
+    const hourOfDay = time.getUTCHours();
+    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
+    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+
     const snapshot = computeSnapshot({
       ...params,
       dateMidday: time,
       T_out: forcing.T_out,
       achTotal: vent.achTotal,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         forcing.source === "epw"
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }

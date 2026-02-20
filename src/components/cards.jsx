@@ -165,18 +165,31 @@ export function OutcomeCard({
           <p className={`${valueClass} font-semibold ${tempColor}`}>
             {currentPoint.T_in.toFixed(1)}°C
           </p>
+          {compact && (
+            <p className="text-[11px] leading-tight text-slate-500">
+              {dateLabel} · {timeLabel}
+            </p>
+          )}
         </div>
         <div>
           <p className="text-xs font-medium text-slate-500">Outdoor</p>
           <p className={`${valueClass} font-semibold text-blue-600`}>
             {outdoorTemp?.toFixed(1) ?? "—"}°C
           </p>
-          <p className="text-xs text-slate-500">{cloudLabel}</p>
+          {compact ? (
+            <p className="text-[11px] leading-tight text-slate-500">
+              {cloudLabel}
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500">{cloudLabel}</p>
+          )}
         </div>
       </div>
-      <p className="text-xs text-slate-500">
-        {dateLabel} · {timeLabel}
-      </p>
+      {!compact && (
+        <p className="text-xs text-slate-500">
+          {dateLabel} · {timeLabel}
+        </p>
+      )}
     </Card>
   );
 }
@@ -421,13 +434,16 @@ export function CostCarbonCard({ title, periodLabel, summary }) {
           <p>{formatGBP(summary.standingCost)}</p>
         </div>
       </div>
-      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
-        <span>Total cost</span>
-        <span className="font-semibold">{formatGBP(summary.totalCost)}</span>
+      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
+        <span className="text-xs">Total cost</span>
+        <span>
+          <span className="text-lg font-bold">{formatGBP(summary.energyCost)}</span>
+          <span className="text-[10px] text-slate-500"> (+{formatGBP(summary.standingCost)})</span>
+        </span>
       </div>
-      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
-        <span>Carbon impact</span>
-        <span className="font-semibold">{formatKg(summary.carbonKg)}</span>
+      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
+        <span className="text-xs">Carbon emissions</span>
+        <span className="text-lg font-bold">{formatKg(summary.carbonKg)}</span>
       </div>
     </Card>
   );

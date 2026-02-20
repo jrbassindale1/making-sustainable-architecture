@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Environment, Html, OrbitControls, Ring, useTexture } from "@react-three/drei";
+import { Environment, Html, OrbitControls, Ring, useProgress, useTexture } from "@react-three/drei";
 import { Bloom, EffectComposer, SSAO, ToneMapping, Vignette } from "@react-three/postprocessing";
 import { BlendFunction, ToneMappingMode } from "postprocessing";
 import {
@@ -68,6 +68,10 @@ const DOWNLIGHT_TRIM_THICKNESS_M = 0.02;
 const DOWNLIGHT_BEAM_RADIUS_M = 0.095;
 const DOWNLIGHT_BEAM_LENGTH_M = 0.08;
 const OVERHANG_COLUMN_SIZE = 0.3; // 300 mm x 300 mm columns (match wall thickness)
+const LOW_POWER_TARGET_FPS = 12;
+const AUTO_LOW_FPS_THRESHOLD = 20;
+const AUTO_RECOVER_FPS_THRESHOLD = 24;
+const AUTO_FPS_SAMPLE_SECONDS = 2.5;
 
 function configureTexture(texture, repeat, useSrgb = false) {
   if (!texture) return;
@@ -3172,6 +3176,63 @@ function ScenePostProcessing({ sunFactor }) {
   );
 }
 
+function FirstFrameReady({ onReady }) {
+  const hasReportedRef = useRef(false);
+
+  useFrame(() => {
+    if (hasReportedRef.current) return;
+    hasReportedRef.current = true;
+    onReady?.();
+  });
+
+  return null;
+}
+
+function LowFpsTicker({ enabled, fps = LOW_POWER_TARGET_FPS }) {
+  const invalidate = useThree((state) => state.invalidate);
+
+  useEffect(() => {
+    if (!enabled) return;
+    invalidate();
+    const intervalMs = Math.max(16, Math.round(1000 / Math.max(1, fps)));
+    const interval = window.setInterval(() => invalidate(), intervalMs);
+    return () => window.clearInterval(interval);
+  }, [enabled, fps, invalidate]);
+
+  return null;
+}
+
+function FpsAutoFallback({ enabled, onChange }) {
+  const sampleRef = useRef({ elapsed: 0, frames: 0, low: false });
+
+  useFrame((_, delta) => {
+    if (!enabled) return;
+    const sample = sampleRef.current;
+    sample.elapsed += delta;
+    sample.frames += 1;
+    if (sample.elapsed < AUTO_FPS_SAMPLE_SECONDS) return;
+
+    const fps = sample.frames / sample.elapsed;
+    const threshold = sample.low ? AUTO_RECOVER_FPS_THRESHOLD : AUTO_LOW_FPS_THRESHOLD;
+    const nextLow = fps < threshold;
+    if (nextLow !== sample.low) {
+      sample.low = nextLow;
+      onChange?.(nextLow);
+    }
+    sample.elapsed = 0;
+    sample.frames = 0;
+  });
+
+  useEffect(() => {
+    if (!enabled) {
+      sampleRef.current = { elapsed: 0, frames: 0, low: false };
+      onChange?.(false);
+    }
+  }, [enabled, onChange]);
+
+  return null;
+}
+
 export function BuildingPreview({
   faceConfigs,
   snapshot,
@@ -3200,6 +3261,8 @@ export function BuildingPreview({
   downlightPenumbra = 1,
   downlightThrowScale = 2.5,
   downlightSourceGlow = 2.5,
+  lowPerformanceMode = false,
+  onAutoPerformanceFallback,
   className,
   canvasClassName,
 }) {
@@ -3257,6 +3320,22 @@ export function BuildingPreview({
   const [isShiftHeld, setIsShiftHeld] = useState(false);
   const [isMouseDown, setIsMouseDown] = useState(false);
   const [isOverClickable, setIsOverClickable] = useState(false);
+  const [autoLowPerformance, setAutoLowPerformance] = useState(false);
+  const [hasRenderedFirstFrame, setHasRenderedFirstFrame] = useState(false);
+  const { active: assetsLoading } = useProgress();
+  const effectiveLowPerformance =
+    !captureMode && (lowPerformanceMode || autoLowPerformance);
+  const showCanvasLoader = !captureMode && (!hasRenderedFirstFrame || assetsLoading);
+
+  useEffect(() => {
+    onAutoPerformanceFallback?.(autoLowPerformance);
+  }, [autoLowPerformance, onAutoPerformanceFallback]);
+
+  useEffect(() => {
+    if (captureMode || lowPerformanceMode) {
+      setAutoLowPerformance(false);
+    }
+  }, [captureMode, lowPerformanceMode]);
 
   // Blue pointer cursor as data URL
   const bluePointerCursor = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%232563eb' d='M7 2l12 11.5-5.5 1 3.5 7-2.5 1-3.5-7L7 19V2z'/%3E%3C/svg%3E") 4 2, pointer`;
@@ -3304,24 +3383,31 @@ export function BuildingPreview({
   return (
     <Card className={cardClass}>
       <div
-        className={`${canvasClass} overflow-hidden rounded-lg bg-slate-200 ${isShiftHeld ? "cursor-move" : isMouseDown ? "cursor-grabbing" : !isOverClickable ? "cursor-pointer" : ""}`}
+        className={`${canvasClass} relative overflow-hidden rounded-lg bg-slate-200 ${isShiftHeld ? "cursor-move" : isMouseDown ? "cursor-grabbing" : !isOverClickable ? "cursor-pointer" : ""}`}
         style={isOverClickable && !isShiftHeld && !isMouseDown ? { cursor: bluePointerCursor } : undefined}
         onMouseDown={() => setIsMouseDown(true)}
       >
         <Canvas
           shadows
-          dpr={[1, 1.5]}
+          dpr={effectiveLowPerformance ? [0.75, 1] : [1, 1.5]}
           camera={{ position: cameraPosition, fov: 45, near: 0.1, far: 60 }}
+          frameloop={effectiveLowPerformance ? "demand" : "always"}
           gl={{ preserveDrawingBuffer: true }}
           className="building-preview-canvas"
         >
+          <LowFpsTicker enabled={effectiveLowPerformance} />
+          <FpsAutoFallback
+            enabled={!captureMode && !lowPerformanceMode}
+            onChange={setAutoLowPerformance}
+          />
+          <FirstFrameReady onReady={() => setHasRenderedFirstFrame(true)} />
           <color attach="background" args={[skyColor]} />
           <fog attach="fog" args={[fogColor, fogNear, fogFar]} />
           <ambientLight intensity={ambientIntensity} />
           <hemisphereLight intensity={hemisphereIntensity} groundColor={hemisphereGround} />
           <directionalLight
             ref={lightRef}
-            castShadow={sunFactor > 0.02}
+            castShadow={!effectiveLowPerformance && sunFactor > 0.02}
             position={lightPosition}
             intensity={sunIntensity}
             color="#ffdf91"
@@ -3337,8 +3423,14 @@ export function BuildingPreview({
             shadow-normalBias={0.02}
           />
           <SunOrb position={sunSpherePosition} opacity={sunSphereOpacity} />
-          <Environment preset="sunset" intensity={0.9 * sunFactor} />
-          <Environment preset="night" intensity={0.55 * (1 - sunFactor)} />
+          <Environment
+            preset="sunset"
+            intensity={(effectiveLowPerformance ? 0.6 : 0.9) * sunFactor}
+          />
+          <Environment
+            preset="night"
+            intensity={(effectiveLowPerformance ? 0.35 : 0.55) * (1 - sunFactor)}
+          />
           <Compass northLineStartRadius={compassNorthLineStartRadius} />
           <RoomModel
             faceConfigs={faceConfigs}
@@ -3370,14 +3462,27 @@ export function BuildingPreview({
             enableZoom
             autoRotate={false}
             autoRotateSpeed={0.35}
-            enableDamping
+            enableDamping={!effectiveLowPerformance}
             dampingFactor={0.08}
             minPolarAngle={Math.PI / 6}
             maxPolarAngle={Math.PI / 1.85}
             target={[0, height / 2, 0]}
           />
-          <ScenePostProcessing sunFactor={sunFactor} />
+          {!effectiveLowPerformance && <ScenePostProcessing sunFactor={sunFactor} />}
         </Canvas>
+        {showCanvasLoader && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-slate-100/70 backdrop-blur-[1px]">
+            <div className="flex flex-col items-center gap-3">
+              <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-300 border-t-slate-700" />
+              <p className="text-sm font-medium text-slate-600">Loading 3D model...</p>
+            </div>
+          </div>
+        )}
+        {effectiveLowPerformance && !showCanvasLoader && (
+          <div className="pointer-events-none absolute left-2 top-2 z-10 rounded-md bg-slate-900/55 px-2 py-1 text-[11px] font-medium text-slate-100">
+            Low-power mode
+          </div>
+        )}
       </div>
       {showMetrics && (
         <div className="grid grid-cols-5 gap-2 text-xs text-slate-600">

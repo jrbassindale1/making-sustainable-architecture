@@ -107,6 +107,25 @@ const DOWNLIGHT_SOURCE_GLOW_DEFAULT = 2.5;
 const STANDARD_SW_WIND_MPH = 5;
 const STANDARD_SW_WIND_MS = STANDARD_SW_WIND_MPH * 0.44704;
 const STANDARD_SW_WIND_DIR_DEG = 225;
+const PNG_EXPORT_RENDER_SETTLE_MS = 900;
+const PASSIVHAUS_U_VALUE_PRESET = "passivhaus";
+const PASSIVHAUS_VENTILATION_PRESET = "passivhaus";
+const PASSIVHAUS_FACE_STATE = {
+  north: { glazing: 0.16, overhang: 0, fin: 0, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  east: { glazing: 0.18, overhang: 0, fin: 0.5, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  south: { glazing: 0.34, overhang: 0.9, fin: 0, hFin: 0.45, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  west: { glazing: 0.18, overhang: 0, fin: 0.5, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+};
+const windowSegmentStateLabel = (state) => {
+  if (state === WINDOW_SEGMENT_STATE.TOP_HUNG) return "top_hung";
+  if (state === WINDOW_SEGMENT_STATE.TURN) return "turn";
+  return "closed";
+};
+const getAnalyticsErrorMessage = (error) => {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "Unknown error";
+};
 
 export default function App() {
   const initialSolsticeDay =
@@ -170,10 +189,28 @@ export default function App() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportingPngs, setExportingPngs] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [forceLowPerfModel, setForceLowPerfModel] = useState(false);
+  const [autoLowPerfModel, setAutoLowPerfModel] = useState(false);
   const mainCaptureRef = useRef(null);
   const moreDetailsRef = useRef(null);
   const dailyChartContainerRef = useRef(null);
   const [dailyChartSize, setDailyChartSize] = useState({ width: 0, height: 0 });
+  const lowPerfModelActive = forceLowPerfModel || autoLowPerfModel;
+  const trackAnalyticsEvent = useCallback((eventName, params = {}) => {
+    if (typeof window === "undefined" || typeof window.gtag !== "function") return;
+    const analyticsParams = import.meta.env.DEV
+      ? { debug_mode: true, ...params }
+      : params;
+    window.gtag("event", eventName, analyticsParams);
+  }, []);
+
+  useEffect(() => {
+    trackAnalyticsEvent("app_loaded", {
+      app_area: "room_comfort_sim",
+      initial_view_mode: "explore",
+      initial_weather_mode: "synthetic",
+    });
+  }, [trackAnalyticsEvent]);
 
   useEffect(() => {
     if (!exportingVideo || typeof document === "undefined") return;
@@ -190,17 +227,24 @@ export default function App() {
         if (cancelled) return;
         setEpwDataset(dataset);
         setEpwLoadError("");
+        trackAnalyticsEvent("weather_epw_loaded", {
+          location_name: dataset?.meta?.name ?? "unknown",
+          timezone_hours: Number(dataset?.meta?.tzHours ?? 0),
+        });
       })
       .catch((error) => {
         if (cancelled) return;
         console.warn("[Weather] EPW load failed, synthetic weather remains active:", error);
         setEpwLoadError(error?.message ?? "Unable to load EPW dataset.");
+        trackAnalyticsEvent("weather_epw_load_failed", {
+          error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+        });
       });
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [trackAnalyticsEvent]);
 
   const faceFacingLabel = (face) => {
     const azimuth = normalizedAzimuth(face.azimuth + orientationDeg);
@@ -214,6 +258,30 @@ export default function App() {
   const epwLoading = !epwDataset && !epwLoadError;
   const effectiveWeatherMode =
     weatherMode === "epw" && epwAvailable ? "epw" : "synthetic";
+  const buildAnalyticsContext = useCallback(
+    () => ({
+      view_mode: viewMode,
+      explore_tab: exploreTab,
+      weather_mode: effectiveWeatherMode,
+      orientation_deg: Math.round(orientationDeg),
+      u_value_preset: uValuePreset,
+      ventilation_preset: ventilationPreset,
+      night_purge: nightPurgeEnabled ? "on" : "off",
+      rooflight_enabled: rooflightEnabled ? "on" : "off",
+      manual_open_sashes: Object.keys(openWindowSegments).length,
+    }),
+    [
+      effectiveWeatherMode,
+      exploreTab,
+      nightPurgeEnabled,
+      openWindowSegments,
+      orientationDeg,
+      rooflightEnabled,
+      uValuePreset,
+      ventilationPreset,
+      viewMode,
+    ],
+  );
   const weatherMeta = useMemo(() => {
     if (effectiveWeatherMode !== "epw" || !epwDataset?.meta) {
       return DEFAULT_SITE;
@@ -273,7 +341,7 @@ export default function App() {
     const observer = new ResizeObserver(() => updateSize());
     observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [viewMode]);
 
   useEffect(() => {
     const maxTotal = Math.max(0, buildingHeight - MIN_WINDOW_CLEAR_HEIGHT);
@@ -319,6 +387,7 @@ export default function App() {
     [ventilationPreset],
   );
   const ventilationAchTotal = activeVentPreset.achTotal;
+  const ventilationHeatRecovery = activeVentPreset.heatRecoveryEfficiency ?? 0;
   const adaptiveVentEnabled = activeVentPreset.isAdaptive === true;
 
   const selectedDate = useMemo(() => dateFromDayOfYearUTC(dayOfYear), [dayOfYear]);
@@ -433,6 +502,29 @@ export default function App() {
   const hasManualOpenWindows = openedWindowArea.openLeafCount > 0;
   const hasManualOpenings = hasManualOpenWindows || hasRooflightOpen;
 
+  const applyPassivhausOverride = useCallback(() => {
+    setUValuePreset(PASSIVHAUS_U_VALUE_PRESET);
+    setVentilationPreset(PASSIVHAUS_VENTILATION_PRESET);
+    setNightPurgeEnabled(true);
+    setFaceState({
+      north: { ...PASSIVHAUS_FACE_STATE.north },
+      east: { ...PASSIVHAUS_FACE_STATE.east },
+      south: { ...PASSIVHAUS_FACE_STATE.south },
+      west: { ...PASSIVHAUS_FACE_STATE.west },
+    });
+    setOpenWindowSegments({});
+    setRooflightEnabled(false);
+    setRooflightState({
+      width: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+      depth: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+      openHeight: 0,
+    });
+    trackAnalyticsEvent("passivhaus_override_applied", {
+      ...buildAnalyticsContext(),
+      preset_id: PASSIVHAUS_U_VALUE_PRESET,
+    });
+  }, [buildAnalyticsContext, trackAnalyticsEvent]);
+
   const setOverallGlazing = (value) => {
     const clamped = Math.max(0, Math.min(0.8, value));
     setFaceState((prev) => {
@@ -540,33 +632,50 @@ export default function App() {
     });
   };
 
-  const toggleRooflightOpen = () => {
+  const toggleRooflightOpen = useCallback(() => {
     if (!rooflightEnabled) return;
+    const nextOpenHeight = rooflightState.openHeight > 0.001 ? 0 : WINDOW_OPEN_TRAVEL_M;
     setRooflightState((prev) => ({
       ...prev,
-      openHeight: prev.openHeight > 0.001 ? 0 : WINDOW_OPEN_TRAVEL_M,
+      openHeight: nextOpenHeight,
     }));
-  };
-  const handleRooflightEnabledChange = (enabled) => {
+    trackAnalyticsEvent("rooflight_open_toggled", {
+      ...buildAnalyticsContext(),
+      open_state: nextOpenHeight > 0.001 ? "open" : "closed",
+      open_height_mm: Math.round(nextOpenHeight * 1000),
+    });
+  }, [buildAnalyticsContext, rooflightEnabled, rooflightState.openHeight, trackAnalyticsEvent]);
+  const handleRooflightEnabledChange = useCallback((enabled) => {
     setRooflightEnabled(enabled);
     if (!enabled) {
       setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
     }
-  };
-
-  const toggleWindowSegment = (faceId, segmentIndex) => {
-    const key = `${faceId}:${segmentIndex}`;
-    setOpenWindowSegments((prev) => {
-      const currentState = normalizeWindowSegmentState(prev[key]);
-      const nextState = nextWindowSegmentState(currentState);
-      if (nextState === WINDOW_SEGMENT_STATE.CLOSED) {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      }
-      return { ...prev, [key]: nextState };
+    trackAnalyticsEvent("rooflight_enabled_changed", {
+      ...buildAnalyticsContext(),
+      enabled: enabled ? "true" : "false",
     });
-  };
+  }, [buildAnalyticsContext, trackAnalyticsEvent]);
+
+  const toggleWindowSegment = useCallback((faceId, segmentIndex) => {
+    const key = `${faceId}:${segmentIndex}`;
+    const currentState = normalizeWindowSegmentState(openWindowSegments[key]);
+    const nextState = nextWindowSegmentState(currentState);
+    let next = openWindowSegments;
+    if (nextState === WINDOW_SEGMENT_STATE.CLOSED) {
+      next = { ...openWindowSegments };
+      delete next[key];
+    } else {
+      next = { ...openWindowSegments, [key]: nextState };
+    }
+    setOpenWindowSegments(next);
+    trackAnalyticsEvent("window_segment_toggled", {
+      ...buildAnalyticsContext(),
+      face_id: faceId,
+      segment_index: segmentIndex,
+      segment_state: windowSegmentStateLabel(nextState),
+      open_sashes_after: Object.keys(next).length,
+    });
+  }, [buildAnalyticsContext, openWindowSegments, trackAnalyticsEvent]);
 
   const baseParamsTemplate = useMemo(
     () => ({
@@ -631,6 +740,7 @@ export default function App() {
         spinupDays: effectiveSpinupDays,
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
+        heatRecoveryEfficiency: ventilationHeatRecovery,
         manualVentilationInput,
         nightPurgeEnabled,
         adaptiveVentEnabled,
@@ -640,6 +750,7 @@ export default function App() {
       selectedDate,
       weatherProvider,
       ventilationAchTotal,
+      ventilationHeatRecovery,
       manualVentilationInput,
       nightPurgeEnabled,
       adaptiveVentEnabled,
@@ -732,6 +843,7 @@ export default function App() {
       : comfortStatus === "cooling"
         ? "Above comfort"
         : "Within comfort";
+  const showDraftWarning = comfortStatus === "heating" && achTotalAtTime > 6;
   const perceivedComfortLabel =
     perceivedComfortStatus === "heating"
       ? "Below comfort"
@@ -770,18 +882,21 @@ export default function App() {
 
   const snapshot = useMemo(() => {
     const indoorTempOverride = selectedPoint?.T_in;
+    // Heat recovery only applies when using mechanical ventilation without manual window openings
+    const effectiveHeatRecovery = hasManualOpenings ? 0 : ventilationHeatRecovery;
     return computeSnapshot({
       ...baseParams,
       dateMidday: dateAtTime,
       T_out: outdoorTemp,
       achTotal: achTotalAtTime,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         currentForcing.source === "epw"
           ? { DNI: currentForcing.DNI, DHI: currentForcing.DHI, GHI: currentForcing.GHI }
           : undefined,
       T_room_override: indoorTempOverride,
     });
-  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, currentForcing, selectedPoint?.T_in]);
+  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, ventilationHeatRecovery, hasManualOpenings, currentForcing, selectedPoint?.T_in]);
   const downlightsOn = useMemo(() => {
     const rawHour =
       Number.isFinite(selectedHour) ? selectedHour : dateAtTime.getUTCHours();
@@ -859,6 +974,10 @@ export default function App() {
         setTimeout(resolve, 0);
       });
     });
+  const waitForMs = (ms) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
 
   const renderCanvasToA4 = (sourceCanvas) => {
     const output = document.createElement("canvas");
@@ -898,6 +1017,15 @@ export default function App() {
     if (exportingPngs) return;
     const frontTarget = mainCaptureRef.current;
     if (!frontTarget) return;
+    const exportStartedAt =
+      typeof performance !== "undefined" && Number.isFinite(performance.now())
+        ? performance.now()
+        : Date.now();
+    trackAnalyticsEvent("export_png_started", {
+      ...buildAnalyticsContext(),
+      day_of_year: dayOfYear,
+      selected_hour: selectedHour,
+    });
     const infoPopoverNodes = Array.from(frontTarget.querySelectorAll("details[data-info-popover]"));
     const previouslyOpenInfoPopovers = infoPopoverNodes.filter((node) => node.open);
     infoPopoverNodes.forEach((node) => {
@@ -965,6 +1093,7 @@ export default function App() {
       // Let layout settle after opening "More details" and updating fixed chart size.
       await waitForNextFrame();
       await waitForNextFrame();
+      await waitForMs(PNG_EXPORT_RENDER_SETTLE_MS);
       const frontClone = frontTarget.cloneNode(true);
       frontExportHost = document.createElement("div");
       frontExportHost.style.position = "fixed";
@@ -1132,9 +1261,26 @@ export default function App() {
         `room-comfort-frontpage-${dateStamp}-${exportStamp}.png`,
         frontA4Canvas,
       );
+      const exportDurationMs = Math.round(
+        (typeof performance !== "undefined" && Number.isFinite(performance.now())
+          ? performance.now()
+          : Date.now()) - exportStartedAt,
+      );
+      trackAnalyticsEvent("export_png_succeeded", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        duration_ms: Math.max(0, exportDurationMs),
+      });
     } catch (error) {
       console.error("[Export] PNG snapshots failed:", error);
       setExportError("PNG export failed. Please try again.");
+      trackAnalyticsEvent("export_png_failed", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+      });
     } finally {
       if (frontExportHost?.parentNode) {
         frontExportHost.parentNode.removeChild(frontExportHost);
@@ -1159,12 +1305,25 @@ export default function App() {
       !HTMLCanvasElement.prototype.captureStream
     ) {
       setExportError("Video export is not supported in this browser. Try Chrome or Edge.");
+      trackAnalyticsEvent("export_video_unsupported", {
+        ...buildAnalyticsContext(),
+        reason: "mediarecorder_or_capturestream_unavailable",
+      });
       return;
     }
+    const exportStartedAt =
+      typeof performance !== "undefined" && Number.isFinite(performance.now())
+        ? performance.now()
+        : Date.now();
     setExportingVideo(true);
     setExportProgress(0);
     setExportError("");
     const previousTime = timeFrac;
+    trackAnalyticsEvent("export_video_started", {
+      ...buildAnalyticsContext(),
+      day_of_year: dayOfYear,
+      selected_hour: selectedHour,
+    });
 
     try {
       await waitForNextFrame();
@@ -1281,9 +1440,27 @@ export default function App() {
         videoBlob,
         mimeType,
       );
+      const exportDurationMs = Math.round(
+        (typeof performance !== "undefined" && Number.isFinite(performance.now())
+          ? performance.now()
+          : Date.now()) - exportStartedAt,
+      );
+      trackAnalyticsEvent("export_video_succeeded", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        duration_ms: Math.max(0, exportDurationMs),
+        size_mb: Number((videoBlob.size / (1024 * 1024)).toFixed(2)),
+      });
     } catch (error) {
       console.error("[Export] Video failed:", error);
       setExportError("Video export failed. Try Chrome/Edge and keep the tab visible.");
+      trackAnalyticsEvent("export_video_failed", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+      });
     } finally {
       setTimeFrac(previousTime);
       setExportingVideo(false);
@@ -1297,6 +1474,7 @@ export default function App() {
         comfortBand: COMFORT_BAND,
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
+        heatRecoveryEfficiency: ventilationHeatRecovery,
         manualVentilationInput,
         nightPurgeEnabled,
         adaptiveVentEnabled,
@@ -1306,6 +1484,7 @@ export default function App() {
       baseParams,
       weatherProvider,
       ventilationAchTotal,
+      ventilationHeatRecovery,
       manualVentilationInput,
       nightPurgeEnabled,
       adaptiveVentEnabled,
@@ -1388,6 +1567,8 @@ export default function App() {
     { id: "evaluate", label: "evaluate (year)" },
   ];
 
+  const passivhausUPreset = U_VALUE_PRESETS[PASSIVHAUS_U_VALUE_PRESET];
+  const passivhausVentPreset = VENTILATION_PRESETS[PASSIVHAUS_VENTILATION_PRESET];
   const exploreTabs = [
     { id: "context", label: "Context" },
     { id: "general", label: "General settings" },
@@ -1395,17 +1576,98 @@ export default function App() {
     { id: "shading", label: "Shading" },
     { id: "fabric", label: "Fabric (U values)" },
     { id: "ventilation", label: "Ventilation" },
+    { id: "passivhaus", label: "Passivhaus" },
     { id: "export", label: "Export" },
   ];
+  const handleViewModeChange = useCallback((nextViewMode) => {
+    if (viewMode === nextViewMode) return;
+    setViewMode(nextViewMode);
+    trackAnalyticsEvent("view_mode_changed", {
+      from_mode: viewMode,
+      to_mode: nextViewMode,
+    });
+  }, [trackAnalyticsEvent, viewMode]);
+  const handleExploreTabChange = useCallback((nextTabId) => {
+    if (exploreTab === nextTabId) return;
+    setExploreTab(nextTabId);
+    trackAnalyticsEvent("explore_tab_changed", {
+      from_tab: exploreTab,
+      to_tab: nextTabId,
+    });
+  }, [exploreTab, trackAnalyticsEvent]);
+  const handleWeatherModeChange = useCallback((nextWeatherMode) => {
+    if (weatherMode === nextWeatherMode) return;
+    setWeatherMode(nextWeatherMode);
+    trackAnalyticsEvent("weather_mode_selected", {
+      requested_mode: nextWeatherMode,
+      previous_mode: weatherMode,
+    });
+  }, [trackAnalyticsEvent, weatherMode]);
+  const handleUPresetChange = useCallback((presetId) => {
+    if (uValuePreset === presetId) return;
+    setUValuePreset(presetId);
+    trackAnalyticsEvent("u_value_preset_selected", {
+      from_preset: uValuePreset,
+      to_preset: presetId,
+    });
+  }, [trackAnalyticsEvent, uValuePreset]);
+  const handleVentilationPresetChange = useCallback((presetId) => {
+    if (ventilationPreset === presetId) return;
+    setVentilationPreset(presetId);
+    trackAnalyticsEvent("ventilation_preset_selected", {
+      from_preset: ventilationPreset,
+      to_preset: presetId,
+    });
+  }, [trackAnalyticsEvent, ventilationPreset]);
+  const handleNightPurgeChange = useCallback((enabled) => {
+    if (nightPurgeEnabled === enabled) return;
+    setNightPurgeEnabled(enabled);
+    trackAnalyticsEvent("night_purge_toggled", {
+      enabled: enabled ? "true" : "false",
+    });
+  }, [nightPurgeEnabled, trackAnalyticsEvent]);
+  const handleForceLowPerfModelChange = useCallback((enabled) => {
+    if (forceLowPerfModel === enabled) return;
+    setForceLowPerfModel(enabled);
+    trackAnalyticsEvent("low_power_mode_toggled", {
+      enabled: enabled ? "true" : "false",
+    });
+  }, [forceLowPerfModel, trackAnalyticsEvent]);
+  const handleAutoLowPerfModelChange = useCallback((enabled, source = "auto") => {
+    if (autoLowPerfModel === enabled) return;
+    setAutoLowPerfModel(enabled);
+    trackAnalyticsEvent("low_power_auto_fallback_changed", {
+      enabled: enabled ? "true" : "false",
+      source,
+    });
+  }, [autoLowPerfModel, trackAnalyticsEvent]);
+  const handleSeasonalMarkSelect = useCallback((mark) => {
+    setDayOfYear(mark.day);
+    trackAnalyticsEvent("seasonal_marker_selected", {
+      marker_label: mark.label,
+      day_of_year: mark.day,
+    });
+  }, [trackAnalyticsEvent]);
+  const handleCloseAllOpenings = useCallback(() => {
+    setOpenWindowSegments({});
+    setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
+    setVentilationPreset("background");
+    trackAnalyticsEvent("manual_openings_reset", {
+      ...buildAnalyticsContext(),
+      previous_open_sashes: Object.keys(openWindowSegments).length,
+      previous_rooflight_open: rooflightState.openHeight > 0.001 ? "true" : "false",
+      resulting_ventilation_preset: "background",
+    });
+  }, [buildAnalyticsContext, openWindowSegments, rooflightState.openHeight, trackAnalyticsEvent]);
 
   return (
     <div className="relative min-h-screen bg-[#f5f3ee] lg:h-[100svh] lg:overflow-hidden">
       <div className="pointer-events-none absolute inset-0 opacity-[0.35] [background-image:linear-gradient(to_right,rgba(15,23,42,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(15,23,42,0.08)_1px,transparent_1px)] [background-size:24px_24px]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.65),transparent_55%)]" />
       <main
-        className={`relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5 ${exportingVideo ? "pointer-events-none select-none" : ""}`}
-        aria-busy={exportingVideo}
-        inert={exportingVideo}
+        className={`relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5 ${exportingVideo || exportingPngs ? "pointer-events-none select-none" : ""}`}
+        aria-busy={exportingVideo || exportingPngs}
+        inert={exportingVideo || exportingPngs}
       >
         <header className="flex flex-col gap-3 border-b border-slate-200/70 pb-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
@@ -1429,7 +1691,7 @@ export default function App() {
                         ? "border-b-2 border-slate-900 text-slate-900"
                         : "border-b-2 border-transparent text-slate-500 hover:border-slate-900 hover:text-slate-900"
                     }`}
-                    onClick={() => setViewMode(tab.id)}
+                    onClick={() => handleViewModeChange(tab.id)}
                   >
                     {tab.label}
                   </button>
@@ -1483,12 +1745,16 @@ export default function App() {
                       size="compact"
                       stretch
                       className="flex-1"
+                      lowPerformanceMode={forceLowPerfModel}
+                      onAutoPerformanceFallback={(enabled) =>
+                        handleAutoLowPerfModelChange(enabled, "performance_monitor")
+                      }
                     />
                   </div>
 
                   <div className="flex h-full min-h-0 flex-col gap-1">
                     <Card
-                      className={`relative z-0 info-popover-host p-3 ${
+                      className={`relative z-0 info-popover-host flex flex-col items-center justify-center p-3 text-center lg:flex-1 ${
                         comfortStatus === "heating"
                           ? "!bg-sky-100"
                           : comfortStatus === "cooling"
@@ -1504,7 +1770,7 @@ export default function App() {
                         </p>
                       </InfoPopover>
                       <p
-                        className={`pr-8 text-xl font-semibold ${
+                        className={`text-xl font-semibold ${
                           comfortStatus === "heating"
                             ? "text-sky-800"
                             : comfortStatus === "cooling"
@@ -1514,6 +1780,13 @@ export default function App() {
                       >
                         {comfortStatusLabel}
                       </p>
+                      <div className="min-h-10 flex items-center justify-center">
+                        {showDraftWarning && (
+                          <p className="text-xs font-medium text-sky-700">
+                            Warning: Ventilation above 6 ACH may cause uncomfortable drafts.
+                          </p>
+                        )}
+                      </div>
                     </Card>
                     <div className="grid gap-1 sm:grid-cols-3 lg:grid-cols-1 lg:min-h-0">
                       <OutcomeCard
@@ -1523,7 +1796,7 @@ export default function App() {
                         outdoorTemp={outdoorTemp}
                         cloudCover={cloudCover}
                         compact
-                        className="h-full min-h-0 p-2 space-y-1"
+                        className="min-h-0 p-2 space-y-1"
                         info={
                           <>
                             <p>
@@ -1725,6 +1998,7 @@ export default function App() {
                             <Line
                               dataKey="roomTemperature"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#0f766e"
                               name="Room temperature"
@@ -1732,6 +2006,7 @@ export default function App() {
                             <Line
                               dataKey="outdoorTemperature"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               strokeDasharray="6 4"
                               stroke="#2563eb"
@@ -1741,6 +2016,7 @@ export default function App() {
                               yAxisId="solar"
                               dataKey="solarGain"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#f59e0b"
                               name="Solar gains"
@@ -1749,6 +2025,7 @@ export default function App() {
                               yAxisId="vent"
                               dataKey="ventAch"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               strokeDasharray="3 3"
                               stroke="#7c3aed"
@@ -1758,6 +2035,7 @@ export default function App() {
                               yAxisId="heatLoss"
                               dataKey="heatLoss"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#e11d48"
                               name="Heat loss"
@@ -1860,6 +2138,10 @@ export default function App() {
                   downlightPenumbra={downlightPenumbra}
                   downlightThrowScale={downlightThrowScale}
                   downlightSourceGlow={downlightSourceGlow}
+                  lowPerformanceMode={forceLowPerfModel}
+                  onAutoPerformanceFallback={(enabled) =>
+                    handleAutoLowPerfModelChange(enabled, "performance_monitor")
+                  }
                 />
 
                 <InsightsCard
@@ -2107,7 +2389,7 @@ export default function App() {
                           <button
                             key={mark.label}
                             type="button"
-                            onClick={() => setDayOfYear(mark.day)}
+                            onClick={() => handleSeasonalMarkSelect(mark)}
                             className="text-[10px] text-slate-500 hover:text-slate-900 hover:underline"
                           >
                             {mark.label}
@@ -2138,25 +2420,25 @@ export default function App() {
                   </Card>
                   <Card className="space-y-3 p-4">
                     <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Settings</p>
-                  <div className="flex flex-wrap gap-2">
-                    {exploreTabs.map((tab) => {
-                      const isActive = exploreTab === tab.id;
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${
-                            isActive
-                              ? "border-slate-900 bg-slate-900 text-white"
-                              : "border-slate-200 text-slate-500 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
-                          }`}
-                          onClick={() => setExploreTab(tab.id)}
-                        >
-                          {tab.label}
-                        </button>
-                      );
-                    })}
-                  </div>
+                    <div className="flex flex-wrap gap-2">
+                      {exploreTabs.map((tab) => {
+                        const isActive = exploreTab === tab.id;
+                        return (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+                              isActive
+                                ? "border-slate-900 bg-slate-900 text-white"
+                                : "border-slate-200 text-slate-500 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
+                            }`}
+                            onClick={() => handleExploreTabChange(tab.id)}
+                          >
+                            {tab.label}
+                          </button>
+                        );
+                      })}
+                    </div>
 
                   <div className="rounded-lg border border-slate-200 bg-white p-3">
                     {exploreTab === "context" && (
@@ -2168,7 +2450,7 @@ export default function App() {
                               size="sm"
                               variant={weatherMode === "synthetic" ? "default" : "secondary"}
                               className="w-full justify-start"
-                              onClick={() => setWeatherMode("synthetic")}
+                              onClick={() => handleWeatherModeChange("synthetic")}
                             >
                               Simplified synthetic (default)
                             </Button>
@@ -2176,7 +2458,7 @@ export default function App() {
                               size="sm"
                               variant={weatherMode === "epw" ? "default" : "secondary"}
                               className="w-full justify-start"
-                              onClick={() => setWeatherMode("epw")}
+                              onClick={() => handleWeatherModeChange("epw")}
                               disabled={!epwAvailable && !epwLoading}
                             >
                               {epwLoading
@@ -2329,6 +2611,40 @@ export default function App() {
                             Status now:{" "}
                             <span className="font-semibold">{downlightsOn ? "On" : "Off"}</span> · Desk light{" "}
                             {Math.round(snapshot.illuminanceLux ?? 0)} lux.
+                          </p>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-slate-800">3D model low-power mode</p>
+                              <p className="text-xs text-slate-500">
+                                Reduces model frame rate and visual effects to help slower computers.
+                              </p>
+                            </div>
+                            <Switch
+                              checked={forceLowPerfModel}
+                              onCheckedChange={handleForceLowPerfModelChange}
+                            />
+                          </div>
+                          {!forceLowPerfModel && autoLowPerfModel && (
+                            <div className="space-y-2">
+                              <p className="text-xs text-amber-700">
+                                Auto fallback is active because low frame rate was detected.
+                              </p>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => handleAutoLowPerfModelChange(false, "manual_reset")}
+                              >
+                                Return to standard quality
+                              </Button>
+                            </div>
+                          )}
+                          <p className="text-xs text-slate-500">
+                            Current mode:{" "}
+                            <span className="font-semibold text-slate-700">
+                              {lowPerfModelActive ? "Low power (~12 FPS)" : "Standard quality"}
+                            </span>
                           </p>
                         </div>
                         <div className="rounded-lg border border-slate-200 bg-white p-3">
@@ -2566,7 +2882,7 @@ export default function App() {
                                   size="sm"
                                   variant={uValuePreset === presetId ? "default" : "secondary"}
                                   className="w-full justify-start"
-                                  onClick={() => setUValuePreset(presetId)}
+                                  onClick={() => handleUPresetChange(presetId)}
                                 >
                                   {preset.label}
                                 </Button>
@@ -2596,7 +2912,7 @@ export default function App() {
                                     size="sm"
                                     variant={ventilationPreset === presetId ? "default" : "secondary"}
                                     className="flex-1 justify-start"
-                                    onClick={() => setVentilationPreset(presetId)}
+                                    onClick={() => handleVentilationPresetChange(presetId)}
                                   >
                                     {preset.label}
                                   </Button>
@@ -2640,7 +2956,7 @@ export default function App() {
                           </div>
                           <Switch
                             checked={adaptiveVentEnabled || nightPurgeEnabled}
-                            onCheckedChange={setNightPurgeEnabled}
+                            onCheckedChange={handleNightPurgeChange}
                             disabled={adaptiveVentEnabled}
                           />
                         </div>
@@ -2649,16 +2965,66 @@ export default function App() {
                             size="sm"
                             variant="secondary"
                             className="w-full"
-                            onClick={() => {
-                              setOpenWindowSegments({});
-                              setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
-                              setVentilationPreset("background");
-                            }}
+                            onClick={handleCloseAllOpenings}
                           >
                             Close all windows
                           </Button>
                           <p className="mt-2 text-xs text-slate-500">
                             Closes all manually opened windows and rooflight, resets to background trickle ventilation.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {exploreTab === "passivhaus" && (
+                      <div className="space-y-2">
+                        <div className="space-y-2 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
+                          <p className="text-sm font-medium text-slate-800">Passivhaus override (indicative)</p>
+                          <p className="text-xs text-slate-600">
+                            Applies a one-click, Passivhaus-style starting point for quick design comparison.
+                          </p>
+                          <Button
+                            size="sm"
+                            className="w-full justify-start"
+                            onClick={applyPassivhausOverride}
+                          >
+                            Apply Passivhaus settings
+                          </Button>
+                          <p className="text-xs text-slate-500">
+                            Orientation is not changed. You keep control of site orientation because solar gains are
+                            orientation-dependent.
+                          </p>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-xs font-medium text-slate-600">What this changes</p>
+                          <ul className="list-disc space-y-1 pl-4 text-xs text-slate-500">
+                            <li>
+                              Fabric preset to{" "}
+                              <span className="font-medium text-slate-700">{passivhausUPreset?.label ?? "Passivhaus"}</span>{" "}
+                              (walls {passivhausUPreset?.values?.wall?.toFixed?.(2) ?? "n/a"}, roof{" "}
+                              {passivhausUPreset?.values?.roof?.toFixed?.(2) ?? "n/a"}, floor{" "}
+                              {passivhausUPreset?.values?.floor?.toFixed?.(2) ?? "n/a"}, windows{" "}
+                              {passivhausUPreset?.values?.window?.toFixed?.(2) ?? "n/a"} W/m²K).
+                            </li>
+                            <li>
+                              Ventilation preset to{" "}
+                              <span className="font-medium text-slate-700">{passivhausVentPreset?.label ?? "MVHR"}</span>{" "}
+                              at {passivhausVentPreset?.achTotal?.toFixed?.(1) ?? "n/a"} ACH.
+                            </li>
+                            <li>Night purge on (adds overnight cooling support from 22:00-06:00).</li>
+                            <li>
+                              Facade defaults: smaller N/E/W glazing, larger south glazing, plus south overhang and
+                              E/W fins to temper summer solar gains.
+                            </li>
+                            <li>Closes all manual window openings and disables rooflight.</li>
+                          </ul>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-xs font-medium text-slate-600">Why these settings</p>
+                          <p className="text-xs text-slate-500">
+                            Passivhaus-style design typically prioritizes very low heat loss, controlled ventilation,
+                            and solar-aware glazing/shading. This preset is intentionally educational and indicative,
+                            not a certification check.
                           </p>
                         </div>
                       </div>
@@ -2744,6 +3110,15 @@ export default function App() {
             <div className="h-20 w-20 animate-spin rounded-full border-[7px] border-slate-300 border-t-slate-800" />
             <p className="text-sm font-semibold tracking-wide text-slate-800">Recording video...</p>
             <p className="text-xs text-slate-600">Progress: {Math.round(exportProgress * 100)}%</p>
+          </div>
+        </div>
+      )}
+      {exportingPngs && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/45 backdrop-blur-[2px]">
+          <div className="flex min-w-[280px] flex-col items-center gap-4 rounded-2xl border border-slate-300/70 bg-[#f5f3ee] px-8 py-8 shadow-2xl">
+            <div className="h-24 w-24 animate-spin rounded-full border-[8px] border-slate-300 border-t-slate-800" />
+            <p className="text-base font-semibold tracking-wide text-slate-800">Exporting PNG snapshot...</p>
+            <p className="text-xs text-slate-600">Preparing chart and rendering page</p>
           </div>
         </div>
       )}
