@@ -55,8 +55,18 @@ export const U_VALUE_PRESETS = {
       window: 0.7,
     },
   },
+  passivhaus: {
+    label: "Passivhaus (indicative)",
+    detail: "Indicative Passivhaus-style fabric values for early-stage option testing (not certification).",
+    values: {
+      wall: 0.1,
+      roof: 0.1,
+      floor: 0.1,
+      window: 0.8,
+    },
+  },
 };
-export const U_VALUE_PRESET_ORDER = ["baseline", "improved", "high"];
+export const U_VALUE_PRESET_ORDER = ["baseline", "improved", "high", "passivhaus"];
 export const DEFAULT_U_VALUE_PRESET = "high";
 
 export const MODEL_YEAR = 2025;
@@ -85,6 +95,12 @@ export const VENTILATION_PRESETS = {
     detail: "Low, steady ventilation.",
     achTotal: 0.6,
   },
+  passivhaus: {
+    label: "MVHR (Passivhaus-style)",
+    detail: "Indicative continuous balanced ventilation for a well-sealed envelope with heat recovery.",
+    achTotal: 0.4,
+    heatRecoveryEfficiency: 0.85,
+  },
   open: {
     label: "Open windows",
     detail: "Typical daytime opening.",
@@ -102,7 +118,7 @@ export const VENTILATION_PRESETS = {
     isAdaptive: true,
   },
 };
-export const VENTILATION_PRESET_ORDER = ["background", "trickle", "open", "adaptive"];
+export const VENTILATION_PRESET_ORDER = ["background", "trickle", "passivhaus", "open", "adaptive"];
 export const DEFAULT_VENTILATION_PRESET = "background";
 export const MAX_VENTILATION_ACH = Math.max(
   ...Object.values(VENTILATION_PRESETS).map((preset) => preset.achTotal),
@@ -222,7 +238,135 @@ export function classifyIlluminance(lux) {
 /* -------------------- Ventilation opening area -------------------- */
 // Constants for natural ventilation calculation
 const DISCHARGE_COEFFICIENT = 0.6; // Typical for window openings
-const CROSS_VENT_VELOCITY = 1.0; // m/s - effective velocity for cross-ventilation
+const CROSS_VENT_VELOCITY = 0.75; // m/s reference velocity for opening-area equivalence helper
+const GRAVITY_MPS2 = 9.81;
+const KELVIN_OFFSET = 273.15;
+const DEFAULT_SYNTHETIC_WIND_MS = 2.2;
+const PRESSURE_COEFF_SINGLE_SIDED = 0.05; // turbulent single-sided pressure difference
+const PRESSURE_COEFF_MULTI_FACE = 0.1; // adjacent facades with modest directional pressure
+const PRESSURE_COEFF_CROSS = 0.35; // opposite facades (windward/leeward path)
+const PRESSURE_COEFF_ROOF_TO_FACADE = 0.18; // roof suction vs facade pressure
+const PRESSURE_COEFF_ROOF_ONLY = 0.12; // rooflight-only case with infiltration make-up path
+const MIN_STACK_HEIGHT_M = 0.5;
+const MAKEUP_AREA_RATIO_OF_FLOOR = 0.004;
+const MIN_MAKEUP_AREA_M2 = 0.02;
+const WIND_SPEED_SHELTER_FACTOR = 0.35; // EPW wind is often exposed 10m wind; reduce to sheltered opening level
+const MAX_EFFECTIVE_OPENING_VELOCITY_MPS = 1.2; // practical natural-vent opening jet speed in small rooms
+const TOP_HUNG_OPENING_EFFECTIVENESS = 0.65;
+const TURN_OPENING_EFFECTIVENESS = 0.45;
+const WINDOW_FRAME_PROFILE = 0.05; // 50 mm fixed frame
+export const WINDOW_OPEN_TRAVEL_M = 0.15; // 150 mm opening travel
+export const MAX_WINDOW_LEAF_WIDTH_M = 0.9; // 900 mm maximum leaf width
+export const MODEL_WALL_THICKNESS_M = 0.3;
+export const MODEL_SLAB_EDGE_PULLBACK_M = 0.02;
+export const ROOFLIGHT_MAX_EDGE_OFFSET_M = 0.5; // min clearance from inside parapet
+export const ROOFLIGHT_MAX_OPEN_M = 0.2;
+export const ROOFLIGHT_MIN_CLEAR_SPAN_M = 1.0;
+export const WINDOW_SEGMENT_STATE = {
+  CLOSED: 0,
+  TOP_HUNG: 1,
+  TURN: 2,
+};
+
+export function normalizeWindowSegmentState(value) {
+  if (typeof value === "boolean") {
+    return value ? WINDOW_SEGMENT_STATE.TOP_HUNG : WINDOW_SEGMENT_STATE.CLOSED;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return WINDOW_SEGMENT_STATE.CLOSED;
+  const rounded = Math.round(numeric);
+  if (rounded <= WINDOW_SEGMENT_STATE.CLOSED) return WINDOW_SEGMENT_STATE.CLOSED;
+  if (rounded >= WINDOW_SEGMENT_STATE.TURN) return WINDOW_SEGMENT_STATE.TURN;
+  return rounded;
+}
+
+export function nextWindowSegmentState(state) {
+  const current = normalizeWindowSegmentState(state);
+  if (current === WINDOW_SEGMENT_STATE.CLOSED) return WINDOW_SEGMENT_STATE.TOP_HUNG;
+  if (current === WINDOW_SEGMENT_STATE.TOP_HUNG) return WINDOW_SEGMENT_STATE.TURN;
+  return WINDOW_SEGMENT_STATE.CLOSED;
+}
+
+export function calculateRoofPlanDimensions(dimensions = {}) {
+  const width = Number.isFinite(dimensions.width) ? dimensions.width : BUILDING_WIDTH;
+  const depth = Number.isFinite(dimensions.depth) ? dimensions.depth : BUILDING_DEPTH;
+  const slabExtraEachSide = Math.max(
+    0,
+    MODEL_WALL_THICKNESS_M - MODEL_SLAB_EDGE_PULLBACK_M,
+  );
+  return {
+    roofWidth: width + slabExtraEachSide * 2,
+    roofDepth: depth + slabExtraEachSide * 2,
+  };
+}
+
+function clampRooflightEdgeInset(value, maxInset) {
+  const safe = Number.isFinite(value) ? value : ROOFLIGHT_MAX_EDGE_OFFSET_M;
+  return Math.max(ROOFLIGHT_MAX_EDGE_OFFSET_M, Math.min(safe, maxInset));
+}
+
+export function resolveRooflightConfig(rooflight = {}, dimensions = {}) {
+  const insideParapetWidth = Number.isFinite(dimensions.width)
+    ? dimensions.width
+    : BUILDING_WIDTH;
+  const insideParapetDepth = Number.isFinite(dimensions.depth)
+    ? dimensions.depth
+    : BUILDING_DEPTH;
+  const minSpan = ROOFLIGHT_MIN_CLEAR_SPAN_M;
+  const maxWidth = Math.max(
+    minSpan,
+    insideParapetWidth - ROOFLIGHT_MAX_EDGE_OFFSET_M * 2,
+  );
+  const maxDepth = Math.max(
+    minSpan,
+    insideParapetDepth - ROOFLIGHT_MAX_EDGE_OFFSET_M * 2,
+  );
+  const width = Math.max(
+    minSpan,
+    Math.min(
+      Number.isFinite(rooflight.width) ? rooflight.width : minSpan,
+      maxWidth,
+    ),
+  );
+  const depth = Math.max(
+    minSpan,
+    Math.min(
+      Number.isFinite(rooflight.depth) ? rooflight.depth : minSpan,
+      maxDepth,
+    ),
+  );
+  const centerX = 0;
+  const centerZ = 0;
+  const westInset = (insideParapetWidth - width) / 2;
+  const eastInset = westInset;
+  const northInset = (insideParapetDepth - depth) / 2;
+  const southInset = northInset;
+  const openHeight = Math.max(
+    0,
+    Math.min(Number.isFinite(rooflight.openHeight) ? rooflight.openHeight : 0, ROOFLIGHT_MAX_OPEN_M),
+  );
+  const openingEdgeLength = width;
+  const openingAreaM2 = Math.max(0, openingEdgeLength * openHeight);
+
+  return {
+    roofWidth: insideParapetWidth,
+    roofDepth: insideParapetDepth,
+    width,
+    depth,
+    maxWidth,
+    maxDepth,
+    centerX,
+    centerZ,
+    northInset,
+    southInset,
+    westInset,
+    eastInset,
+    openHeight,
+    openingEdgeLength,
+    openingAreaM2,
+    isOpen: openHeight > 1e-6,
+  };
+}
 
 /**
  * Calculate the required free opening area to achieve a given ACH
@@ -250,6 +394,238 @@ export function calculateOpeningArea(achTotal, volume) {
     areaM2: openingAreaM2,
     sashSideMm,
     casementPercent: Math.min(100, casementPercent),
+  };
+}
+
+export function calculateAchFromOpeningArea(openingAreaM2, volume) {
+  const safeVolume = Math.max(0, Number.isFinite(volume) ? volume : 0);
+  if (safeVolume <= 0) return 0;
+  const safeArea = Math.max(0, Number.isFinite(openingAreaM2) ? openingAreaM2 : 0);
+  const flowRate = DISCHARGE_COEFFICIENT * safeArea * CROSS_VENT_VELOCITY;
+  return (flowRate * 3600) / safeVolume;
+}
+
+function equivalentOpeningArea(areaA, areaB) {
+  const a = Math.max(0, Number.isFinite(areaA) ? areaA : 0);
+  const b = Math.max(0, Number.isFinite(areaB) ? areaB : 0);
+  if (a <= 1e-9 || b <= 1e-9) return 0;
+  return 1 / Math.sqrt(1 / (a * a) + 1 / (b * b));
+}
+
+function pressureDrivenFlowRate(openingAreaM2, deltaPressurePa) {
+  const area = Math.max(0, Number.isFinite(openingAreaM2) ? openingAreaM2 : 0);
+  const pressure = Math.max(0, Number.isFinite(deltaPressurePa) ? deltaPressurePa : 0);
+  if (area <= 1e-9 || pressure <= 1e-9) return 0;
+  const theoreticalVelocity = Math.sqrt((2 * pressure) / RHO_AIR);
+  const effectiveVelocity = Math.min(MAX_EFFECTIVE_OPENING_VELOCITY_MPS, theoreticalVelocity);
+  return DISCHARGE_COEFFICIENT * area * effectiveVelocity;
+}
+
+export function calculateManualWindowVentilation(openedWindowArea, volume, options = {}) {
+  const safeVolume = Math.max(0, Number.isFinite(volume) ? volume : 0);
+  const byFace = openedWindowArea?.byFace ?? {};
+  const roomHeightM = Math.max(
+    0.1,
+    Number.isFinite(options.roomHeightM) ? options.roomHeightM : BUILDING_HEIGHT,
+  );
+  const stackHeightM = Math.max(
+    MIN_STACK_HEIGHT_M,
+    Number.isFinite(options.stackHeightM) ? options.stackHeightM : roomHeightM * 0.65,
+  );
+  const windMS = Math.max(
+    0,
+    Number.isFinite(options.windMS) ? options.windMS : DEFAULT_SYNTHETIC_WIND_MS,
+  );
+  const effectiveWindMS = windMS * WIND_SPEED_SHELTER_FACTOR;
+  const indoorTempC = Number.isFinite(options.indoorTempC) ? options.indoorTempC : 21;
+  const outdoorTempC = Number.isFinite(options.outdoorTempC) ? options.outdoorTempC : indoorTempC;
+  const roofOpeningAreaM2 = Math.max(
+    0,
+    Number.isFinite(options.roofOpeningAreaM2) ? options.roofOpeningAreaM2 : 0,
+  );
+  const windPressurePa = 0.5 * RHO_AIR * effectiveWindMS * effectiveWindMS;
+  const meanAirTempK = Math.max(260, KELVIN_OFFSET + (indoorTempC + outdoorTempC) / 2);
+  const stackPressurePa =
+    RHO_AIR * GRAVITY_MPS2 * stackHeightM * (Math.abs(indoorTempC - outdoorTempC) / meanAirTempK);
+  const areaByFace = FACES.reduce((acc, face) => {
+    const area = byFace?.[face.id]?.openAreaM2;
+    acc[face.id] = Math.max(0, Number.isFinite(area) ? area : 0);
+    return acc;
+  }, {});
+  const totalOpenAreaM2 = FACES.reduce((sum, face) => sum + areaByFace[face.id], 0);
+  const totalManualOpenAreaM2 = totalOpenAreaM2 + roofOpeningAreaM2;
+  const openFaceIds = FACES.filter((face) => areaByFace[face.id] > 1e-6).map((face) => face.id);
+
+  if (safeVolume <= 0 || totalManualOpenAreaM2 <= 1e-6) {
+    return {
+      mode: "none",
+      modeLabel: "none",
+      openFaceIds: [],
+      totalOpenAreaM2: 0,
+      totalManualOpenAreaM2: 0,
+      roofOpeningAreaM2: 0,
+      crossAreaM2: 0,
+      residualAreaM2: 0,
+      roofFlowM3s: 0,
+      facadePressurePa: 0,
+      roofPressurePa: 0,
+      windMS,
+      effectiveWindMS,
+      windPressurePa,
+      stackPressurePa,
+      flowRateM3s: 0,
+      manualOpenAchRaw: 0,
+      manualOpenAch: 0,
+      wasCapped: false,
+      equivalentCrossAreaM2: 0,
+      activeCrossPair: null,
+    };
+  }
+
+  const nsCrossArea = equivalentOpeningArea(areaByFace.north, areaByFace.south);
+  const ewCrossArea = equivalentOpeningArea(areaByFace.east, areaByFace.west);
+  const hasCrossPair = nsCrossArea > 1e-6 || ewCrossArea > 1e-6;
+  const crossAreaM2 = hasCrossPair ? Math.max(nsCrossArea, ewCrossArea) : 0;
+  const activeCrossPair =
+    crossAreaM2 <= 1e-6
+      ? null
+      : nsCrossArea >= ewCrossArea
+        ? "north-south"
+        : "east-west";
+
+  let mode = "single-sided";
+  let modeLabel = "single-sided";
+  let facadeFlowRateM3s = 0;
+  let residualAreaM2 = totalOpenAreaM2;
+  let facadePressurePa = windPressurePa * PRESSURE_COEFF_SINGLE_SIDED;
+
+  if (totalOpenAreaM2 <= 1e-6) {
+    mode = "roof-only";
+    modeLabel = "rooflight-only";
+    residualAreaM2 = 0;
+    facadePressurePa = 0;
+  } else if (hasCrossPair && crossAreaM2 > 1e-6) {
+    mode = "cross";
+    modeLabel = "cross-ventilation";
+    facadePressurePa = windPressurePa * PRESSURE_COEFF_CROSS;
+    residualAreaM2 = Math.max(0, totalOpenAreaM2 - crossAreaM2 * 2);
+    const crossFlow = pressureDrivenFlowRate(crossAreaM2, facadePressurePa);
+    const residualFlow = pressureDrivenFlowRate(
+      residualAreaM2,
+      windPressurePa * PRESSURE_COEFF_SINGLE_SIDED,
+    );
+    facadeFlowRateM3s = crossFlow + residualFlow;
+  } else if (openFaceIds.length >= 2) {
+    mode = "multi-face";
+    modeLabel = "multi-face";
+    residualAreaM2 = totalOpenAreaM2;
+    facadePressurePa = windPressurePa * PRESSURE_COEFF_MULTI_FACE;
+    facadeFlowRateM3s = pressureDrivenFlowRate(totalOpenAreaM2, facadePressurePa);
+  } else {
+    facadeFlowRateM3s = pressureDrivenFlowRate(totalOpenAreaM2, facadePressurePa);
+  }
+
+  let roofPressurePa = 0;
+  let roofFlowM3s = 0;
+  if (roofOpeningAreaM2 > 1e-6) {
+    if (totalOpenAreaM2 > 1e-6) {
+      roofPressurePa =
+        windPressurePa * PRESSURE_COEFF_ROOF_TO_FACADE + stackPressurePa;
+      const roofEquivalentAreaM2 = equivalentOpeningArea(totalOpenAreaM2, roofOpeningAreaM2);
+      roofFlowM3s = pressureDrivenFlowRate(roofEquivalentAreaM2, roofPressurePa);
+    } else {
+      const floorAreaM2 = safeVolume / roomHeightM;
+      const makeUpAreaM2 = Math.max(MIN_MAKEUP_AREA_M2, floorAreaM2 * MAKEUP_AREA_RATIO_OF_FLOOR);
+      roofPressurePa = windPressurePa * PRESSURE_COEFF_ROOF_ONLY + stackPressurePa;
+      const roofOnlyEquivalentAreaM2 = equivalentOpeningArea(roofOpeningAreaM2, makeUpAreaM2);
+      roofFlowM3s = pressureDrivenFlowRate(roofOnlyEquivalentAreaM2, roofPressurePa);
+    }
+  }
+
+  const flowRateM3s =
+    roofFlowM3s > 0 && facadeFlowRateM3s > 0
+      ? Math.sqrt(facadeFlowRateM3s ** 2 + roofFlowM3s ** 2)
+      : facadeFlowRateM3s + roofFlowM3s;
+  const manualOpenAchRaw = (flowRateM3s * 3600) / safeVolume;
+  const manualOpenAch = Number.isFinite(manualOpenAchRaw) ? Math.max(0, manualOpenAchRaw) : 0;
+  const wasCapped = false;
+  const equivalentCrossAreaM2 = crossAreaM2;
+
+  return {
+    mode,
+    modeLabel,
+    openFaceIds,
+    totalOpenAreaM2,
+    totalManualOpenAreaM2,
+    roofOpeningAreaM2,
+    crossAreaM2,
+    residualAreaM2,
+    roofFlowM3s,
+    facadePressurePa,
+    roofPressurePa,
+    windMS,
+    effectiveWindMS,
+    windPressurePa,
+    stackPressurePa,
+    facadeFlowRateM3s,
+    flowRateM3s,
+    manualOpenAchRaw,
+    manualOpenAch,
+    wasCapped,
+    equivalentCrossAreaM2,
+    activeCrossPair,
+  };
+}
+
+export function assessVentilationComfort({ achTotal, indoorTemp, outdoorTemp }) {
+  const ach = Math.max(0, Number.isFinite(achTotal) ? achTotal : 0);
+  const indoor = Number.isFinite(indoorTemp) ? indoorTemp : 0;
+  const outdoor = Number.isFinite(outdoorTemp) ? outdoorTemp : indoor;
+  const deltaT = indoor - outdoor;
+  const achAboveBackground = Math.max(0, ach - ACH_INFILTRATION_DEFAULT);
+
+  // Base draught cooling potential from airflow alone.
+  const baseCoolingC =
+    achAboveBackground <= 0.3
+      ? 0
+      : achAboveBackground <= 2
+        ? (achAboveBackground - 0.3) * 0.18
+        : 0.31 + (achAboveBackground - 2) * 0.24;
+
+  // Cooler outdoor air increases discomfort; warmer outdoor air reduces it.
+  const tempFactor =
+    deltaT <= 0
+      ? 0.25
+      : Math.min(1.6, 0.35 + deltaT / 10);
+
+  const apparentCoolingC = Math.min(3.5, Math.max(0, baseCoolingC * tempFactor));
+  const perceivedTempC = indoor - apparentCoolingC;
+
+  let risk = "low";
+  let label = "Low draught risk";
+  if (apparentCoolingC >= 1.5) {
+    risk = "high";
+    label = "High draught risk";
+  } else if (apparentCoolingC >= 0.8) {
+    risk = "moderate";
+    label = "Moderate draught risk";
+  } else if (apparentCoolingC >= 0.3) {
+    risk = "slight";
+    label = "Slight draught risk";
+  }
+
+  const isLikelyUncomfortable = apparentCoolingC >= 1;
+
+  return {
+    achTotal: ach,
+    indoorTempC: indoor,
+    outdoorTempC: outdoor,
+    deltaTC: deltaT,
+    apparentCoolingC,
+    perceivedTempC,
+    risk,
+    label,
+    isLikelyUncomfortable,
   };
 }
 
@@ -392,14 +768,37 @@ export function epwForcingAt(dateLocal, dataset) {
   };
 }
 
+export function syntheticWindSpeedAt(dateLocal, profile = SYNTHETIC_PROFILE) {
+  const hour = localSolarHour(dateLocal, profile.longitude);
+  const day = dayOfYearUTC(dateLocal);
+  const meanWindMS = Number.isFinite(profile?.meanWindMS)
+    ? profile.meanWindMS
+    : DEFAULT_SYNTHETIC_WIND_MS;
+  // Daytime breezes are usually stronger; winter tends to be windier than summer.
+  const diurnalBoost = Math.max(0, Math.sin(((hour - 6) * Math.PI) / 12));
+  const seasonalBoost = Math.cos((2 * Math.PI * (day - WINTER_SOLSTICE_DAY)) / DAYS_PER_YEAR);
+  const windMS = meanWindMS + 0.7 * diurnalBoost + 0.5 * seasonalBoost;
+  return Math.max(0.3, Math.min(12, windMS));
+}
+
 export function forcingAt(dateLocal, provider) {
+  const fallbackWindMS = syntheticWindSpeedAt(
+    dateLocal,
+    provider?.syntheticProfile || SYNTHETIC_PROFILE,
+  );
   if (provider?.mode === "epw" && provider.dataset) {
     const epw = epwForcingAt(dateLocal, provider.dataset);
-    if (epw) return { ...epw, source: "epw" };
+    if (epw) {
+      return {
+        ...epw,
+        windMS: Number.isFinite(epw.windMS) ? epw.windMS : fallbackWindMS,
+        source: "epw",
+      };
+    }
   }
 
   const T_out = outdoorTemperatureAt(dateLocal, provider.syntheticProfile || SYNTHETIC_PROFILE);
-  return { T_out, source: "synthetic" };
+  return { T_out, windMS: fallbackWindMS, source: "synthetic" };
 }
 
 export function isNightHour(hour) {
@@ -503,35 +902,215 @@ export function normalizedAzimuth(azimuthDeg) {
   return ((azimuthDeg % 360) + 360) % 360;
 }
 
-export function ratioToDepthMeters(ratio) {
-  return Math.max(0, Math.min(1, ratio || 0)) * BUILDING_HEIGHT;
+export function ratioToDepthMeters(ratio, buildingHeight = BUILDING_HEIGHT) {
+  return Math.max(0, Math.min(1, ratio || 0)) * buildingHeight;
 }
 
-export function buildWindowsFromFaceState(faceState, orientationDeg = 0) {
+export const MIN_WINDOW_CLEAR_HEIGHT = 0.4;
+const EXTERNAL_SHADING_PROJECTION_M = 0.3; // 300 mm projection for fins/louvers
+
+export function resolveWindowOpeningHeight(
+  openingHeight,
+  cillLift = 0,
+  headDrop = 0,
+  minClearHeight = MIN_WINDOW_CLEAR_HEIGHT,
+) {
+  const safeOpeningHeight = Math.max(0, openingHeight);
+  const safeMinClear = Math.max(0, minClearHeight);
+  const maxOffset = Math.max(0, safeOpeningHeight - safeMinClear);
+  const safeCillLift = Math.max(0, Math.min(cillLift ?? 0, maxOffset));
+  const maxHeadDrop = Math.max(0, safeOpeningHeight - safeCillLift - safeMinClear);
+  const safeHeadDrop = Math.max(0, Math.min(headDrop ?? 0, maxHeadDrop));
+  const effectiveHeight = Math.max(0, safeOpeningHeight - safeCillLift - safeHeadDrop);
+  return {
+    cillLift: safeCillLift,
+    headDrop: safeHeadDrop,
+    effectiveHeight,
+  };
+}
+
+export function clampWindowCenterRatio(glazingRatio, centerRatio = 0) {
+  const glazing = Math.max(0, Math.min(0.8, glazingRatio || 0));
+  const maxRatio = Math.max(0, 1 - glazing);
+  const safeCenter = Number.isFinite(centerRatio) ? centerRatio : 0;
+  return Math.max(-maxRatio, Math.min(maxRatio, safeCenter));
+}
+
+function operableLeafGeometry(faceSpan, glazingRatio, roomHeight, cillLift = 0, headDrop = 0) {
+  const glazing = Math.max(0, Math.min(0.8, glazingRatio || 0));
+  if (glazing <= 0.001) return null;
+
+  const opening = resolveWindowOpeningHeight(roomHeight, cillLift, headDrop);
+  const windowHeight = opening.effectiveHeight;
+  if (windowHeight <= 0.001) return null;
+
+  const windowWidth = faceSpan * glazing;
+  const outerFrameProfile = Math.min(
+    WINDOW_FRAME_PROFILE,
+    windowWidth * 0.45,
+    windowHeight * 0.45,
+  );
+  const clearOpeningWidth = Math.max(0.02, windowWidth - outerFrameProfile * 2);
+  const clearOpeningHeight = Math.max(0.02, windowHeight - outerFrameProfile * 2);
+  const leafCount = Math.max(1, Math.ceil(clearOpeningWidth / MAX_WINDOW_LEAF_WIDTH_M));
+  const mullionWidth = leafCount > 1 ? outerFrameProfile : 0;
+  const leafWidth = Math.max(
+    0.02,
+    (clearOpeningWidth - mullionWidth * (leafCount - 1)) / leafCount,
+  );
+  const effectiveOpenTravel = Math.min(WINDOW_OPEN_TRAVEL_M, clearOpeningHeight);
+  const topHungOpeningAreaPerLeaf = Math.max(
+    0,
+    leafWidth * effectiveOpenTravel * TOP_HUNG_OPENING_EFFECTIVENESS,
+  );
+  const turnOpeningAreaPerLeaf = Math.max(
+    0,
+    leafWidth * clearOpeningHeight * TURN_OPENING_EFFECTIVENESS,
+  );
+
+  return {
+    leafCount,
+    topHungOpeningAreaPerLeaf,
+    turnOpeningAreaPerLeaf,
+    openingAreaTotal:
+      Math.max(topHungOpeningAreaPerLeaf, turnOpeningAreaPerLeaf) * leafCount,
+  };
+}
+
+export function calculateOpenedWindowArea(faceState, dimensions = {}, openWindowSegments = {}) {
+  const width = Number.isFinite(dimensions.width) ? dimensions.width : BUILDING_WIDTH;
+  const depth = Number.isFinite(dimensions.depth) ? dimensions.depth : BUILDING_DEPTH;
+  const height = Number.isFinite(dimensions.height) ? dimensions.height : BUILDING_HEIGHT;
+  const byFace = {};
+  let totalOpenAreaM2 = 0;
+  let topHungAreaM2 = 0;
+  let turnAreaM2 = 0;
+  let openLeafCount = 0;
+  let topHungLeafCount = 0;
+  let turnLeafCount = 0;
+  let totalLeafCount = 0;
+
+  FACES.forEach((face) => {
+    const config = faceState?.[face.id];
+    const faceSpan = face.id === "east" || face.id === "west" ? depth : width;
+    const geometry = operableLeafGeometry(
+      faceSpan,
+      config?.glazing,
+      height,
+      config?.cillLift,
+      config?.headDrop,
+    );
+    if (!geometry) {
+      byFace[face.id] = {
+        openAreaM2: 0,
+        topHungAreaM2: 0,
+        turnAreaM2: 0,
+        openLeafCount: 0,
+        topHungLeafCount: 0,
+        turnLeafCount: 0,
+        totalLeafCount: 0,
+      };
+      return;
+    }
+
+    let faceOpenLeafCount = 0;
+    let faceTopHungLeafCount = 0;
+    let faceTurnLeafCount = 0;
+    let faceOpenArea = 0;
+    let faceTopHungArea = 0;
+    let faceTurnArea = 0;
+    for (let leafIndex = 0; leafIndex < geometry.leafCount; leafIndex += 1) {
+      const key = `${face.id}:${leafIndex}`;
+      const leafState = normalizeWindowSegmentState(openWindowSegments?.[key]);
+      if (leafState === WINDOW_SEGMENT_STATE.TOP_HUNG) {
+        faceOpenLeafCount += 1;
+        faceTopHungLeafCount += 1;
+        faceOpenArea += geometry.topHungOpeningAreaPerLeaf;
+        faceTopHungArea += geometry.topHungOpeningAreaPerLeaf;
+      } else if (leafState === WINDOW_SEGMENT_STATE.TURN) {
+        faceOpenLeafCount += 1;
+        faceTurnLeafCount += 1;
+        faceOpenArea += geometry.turnOpeningAreaPerLeaf;
+        faceTurnArea += geometry.turnOpeningAreaPerLeaf;
+      }
+    }
+
+    byFace[face.id] = {
+      openAreaM2: faceOpenArea,
+      topHungAreaM2: faceTopHungArea,
+      turnAreaM2: faceTurnArea,
+      openLeafCount: faceOpenLeafCount,
+      topHungLeafCount: faceTopHungLeafCount,
+      turnLeafCount: faceTurnLeafCount,
+      totalLeafCount: geometry.leafCount,
+    };
+    totalOpenAreaM2 += faceOpenArea;
+    topHungAreaM2 += faceTopHungArea;
+    turnAreaM2 += faceTurnArea;
+    openLeafCount += faceOpenLeafCount;
+    topHungLeafCount += faceTopHungLeafCount;
+    turnLeafCount += faceTurnLeafCount;
+    totalLeafCount += geometry.leafCount;
+  });
+
+  return {
+    totalOpenAreaM2,
+    topHungAreaM2,
+    turnAreaM2,
+    openLeafCount,
+    topHungLeafCount,
+    turnLeafCount,
+    totalLeafCount,
+    byFace,
+  };
+}
+
+export function buildWindowsFromFaceState(
+  faceState,
+  orientationDeg = 0,
+  dimensions = {}
+) {
+  const width = Number.isFinite(dimensions.width) ? dimensions.width : BUILDING_WIDTH;
+  const depth = Number.isFinite(dimensions.depth) ? dimensions.depth : BUILDING_DEPTH;
+  const height = Number.isFinite(dimensions.height) ? dimensions.height : BUILDING_HEIGHT;
   return FACES.map((face) => {
     const config = faceState[face.id];
     if (!config || config.glazing <= 0) return null;
     const glazing = Math.max(0, Math.min(0.8, config.glazing));
-    const faceSpan = face.id === "east" || face.id === "west" ? BUILDING_DEPTH : BUILDING_WIDTH;
+    const faceSpan = face.id === "east" || face.id === "west" ? depth : width;
+    const opening = resolveWindowOpeningHeight(height, config.cillLift, config.headDrop);
+    if (opening.effectiveHeight <= 0.001) return null;
     return {
       w: faceSpan * glazing,
-      h: BUILDING_HEIGHT,
+      h: opening.effectiveHeight,
       az: normalizedAzimuth(face.azimuth + orientationDeg),
-      overhangDepth: ratioToDepthMeters(config.overhang),
-      finDepth: ratioToDepthMeters(config.fin),
-      hFinDepth: ratioToDepthMeters(config.hFin),
+      overhangDepth: Math.max(0, Math.min(1.5, config.overhang || 0)),
+      finDepth: ratioToDepthMeters(config.fin, height),
+      hFinDepth: ratioToDepthMeters(config.hFin, height),
     };
   }).filter(Boolean);
 }
 
-export function buildPreviewFaceConfigs(faceState) {
+export function buildPreviewFaceConfigs(faceState, dimensions = {}) {
+  const height = Number.isFinite(dimensions.height) ? dimensions.height : BUILDING_HEIGHT;
   return FACES.reduce((acc, face) => {
-    const config = faceState[face.id] || { glazing: 0, overhang: 0, fin: 0, hFin: 0 };
+    const config = faceState[face.id] || {
+      glazing: 0,
+      overhang: 0,
+      fin: 0,
+      hFin: 0,
+      cillLift: 0,
+      headDrop: 0,
+      windowCenterRatio: 0,
+    };
+    const glazing = Math.max(0, Math.min(0.8, config.glazing));
     acc[face.id] = {
-      glazing: Math.max(0, Math.min(0.8, config.glazing)),
-      overhang: ratioToDepthMeters(config.overhang),
-      fin: ratioToDepthMeters(config.fin),
-      hFin: ratioToDepthMeters(config.hFin),
+      glazing,
+      overhang: Math.max(0, Math.min(1.5, config.overhang || 0)),
+      fin: ratioToDepthMeters(config.fin, height),
+      hFin: ratioToDepthMeters(config.hFin, height),
+      windowCenterRatio: clampWindowCenterRatio(glazing, config.windowCenterRatio ?? 0),
+      ...resolveWindowOpeningHeight(height, config.cillLift, config.headDrop),
     };
     return acc;
   }, {});
@@ -544,6 +1123,9 @@ export function cloneFaceState(faceState) {
       overhang: faceState[face.id]?.overhang ?? 0,
       fin: faceState[face.id]?.fin ?? 0,
       hFin: faceState[face.id]?.hFin ?? 0,
+      cillLift: faceState[face.id]?.cillLift ?? 0,
+      headDrop: faceState[face.id]?.headDrop ?? 0,
+      windowCenterRatio: faceState[face.id]?.windowCenterRatio ?? 0,
     };
     return acc;
   }, {});
@@ -694,32 +1276,53 @@ export function overhangShadingFraction(windowH, depth_m, altDeg, azimuthDeg, su
   return Math.max(0, Math.min(1, L / windowH));
 }
 
-export function finsShadingFraction(windowW, finDepth_m, azimuthDeg, surfaceAzimuthDeg) {
+export function finsShadingFraction(windowH, finDepth_m, azimuthDeg, surfaceAzimuthDeg, overhangDepth = 0, altitudeDeg = 45) {
   if (finDepth_m <= 0) return 0;
 
   // Check if sun is hitting this surface (within ±90° of surface normal)
   const dAzDeg = ((azimuthDeg - surfaceAzimuthDeg + 540) % 360) - 180;
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
-  // Brise-soleil geometry: fins at regular intervals with fixed 0.5m projection
-  const FIN_PROJECTION = 0.5; // Fixed 50cm projection
-  const MIN_GAP = 0.15; // Minimum gap between fins (dense)
-  const MAX_GAP = 1.2; // Maximum gap between fins (sparse)
+  // Brise-soleil geometry: fins at regular intervals with fixed projection
+  // These values match the visual rendering in BuildingPreview.jsx/WallFace.jsx
+  const FIN_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
+  const MIN_GAP = 0.1; // 10cm spacing (dense) - matches rendering
+  const MAX_GAP = 0.6; // 60cm spacing (sparse) - matches rendering
 
   // finDepth_m is actually a ratio encoded as meters (0 to ~2.6m)
   // Convert back to 0-1 ratio to calculate gap
-  const ratio = Math.min(1, finDepth_m / BUILDING_HEIGHT);
-  const gap = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
+  const ratio = Math.min(1, finDepth_m / Math.max(0.001, windowH));
+  const effectiveRatio = Math.max(0, Math.min(1, ratio));
+  const gap = MAX_GAP - effectiveRatio * (MAX_GAP - MIN_GAP);
 
   // Calculate shadow width from each fin based on sun angle
   const dAz = deg2rad(dAzDeg);
   const shadowWidth = Math.abs(FIN_PROJECTION * Math.tan(dAz));
 
-  // Shading fraction is the ratio of shadow width to gap between fins
-  return Math.max(0, Math.min(1, shadowWidth / gap));
+  // Base shading fraction is the ratio of shadow width to gap between fins
+  let shadingFraction = shadowWidth / gap;
+
+  // When fins are at overhang position (> 1m from face), they move out between columns
+  // Account for shadow geometry - shadows must travel further to reach the window
+  if (overhangDepth > 1) {
+    // Actual distance from fins to window plane (accounting for fin projection)
+    const distanceFromWindow = overhangDepth - FIN_PROJECTION / 2;
+
+    // At low altitudes, shadows from distant fins may fall below the window
+    // Shadow drop over distance = distance / tan(altitude)
+    const altRad = deg2rad(Math.max(5, altitudeDeg));
+    const shadowDrop = distanceFromWindow / Math.tan(altRad);
+
+    // Reduce effectiveness proportionally based on how much shadow misses the window
+    // At 1.5m overhang (max), shadow drop is significant at low sun angles
+    const dropFactor = Math.max(0, 1 - shadowDrop / (windowH * 1.5));
+    shadingFraction *= dropFactor;
+  }
+
+  return Math.max(0, Math.min(1, shadingFraction));
 }
 
-export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azimuthDeg, surfaceAzimuthDeg) {
+export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azimuthDeg, surfaceAzimuthDeg, overhangDepth = 0) {
   if (hFinDepth_m <= 0 || altDeg <= 0) return 0;
 
   // Check if sun is hitting this surface (within ±90° of surface normal)
@@ -727,22 +1330,43 @@ export function horizontalFinsShadingFraction(windowH, hFinDepth_m, altDeg, azim
   if (Math.abs(dAzDeg) >= 90) return 0; // Sun is behind this surface
 
   // Horizontal louver geometry: slats at regular intervals with fixed projection
-  const SLAT_PROJECTION = 0.5; // Fixed 50cm projection (matches vertical fins)
-  const MIN_GAP = 0.1; // Minimum gap between slats (dense)
-  const MAX_GAP = 0.6; // Maximum gap between slats (sparse)
+  // These values match the visual rendering in BuildingPreview.jsx/WallFace.jsx
+  const SLAT_PROJECTION = EXTERNAL_SHADING_PROJECTION_M;
+  const MIN_GAP = 0.1; // 10cm spacing (dense) - matches rendering
+  const MAX_GAP = 0.6; // 60cm spacing (sparse) - matches rendering
 
   // hFinDepth_m is a ratio encoded as meters (0 to ~2.6m)
   // Convert back to 0-1 ratio to calculate gap
-  const ratio = Math.min(1, hFinDepth_m / BUILDING_HEIGHT);
-  const gap = MAX_GAP - ratio * (MAX_GAP - MIN_GAP);
+  const ratio = Math.min(1, hFinDepth_m / Math.max(0.001, windowH));
+  const effectiveRatio = Math.max(0, Math.min(1, ratio));
+  const gap = MAX_GAP - effectiveRatio * (MAX_GAP - MIN_GAP);
 
   // Calculate shadow depth from each slat based on profile angle (sun altitude relative to surface)
   const phi = profileAngle(altDeg, azimuthDeg, surfaceAzimuthDeg);
   if (phi <= 0) return 0;
   const shadowDepth = SLAT_PROJECTION * Math.tan(deg2rad(phi));
 
-  // Shading fraction is the ratio of shadow depth to gap between slats
-  return Math.max(0, Math.min(1, shadowDepth / gap));
+  // Base shading fraction is the ratio of shadow depth to gap between slats
+  let shadingFraction = shadowDepth / gap;
+
+  // When louvres are at overhang position (> 1m from face), they move out between columns
+  // Account for shadow geometry - shadows must travel further to reach the window
+  if (overhangDepth > 1) {
+    // Actual distance from louvres to window plane (accounting for slat projection)
+    const distanceFromWindow = overhangDepth - SLAT_PROJECTION / 2;
+
+    // At low profile angles, shadows from distant louvres may fall in front of window
+    // Shadow vertical drop over horizontal distance = distance / tan(profile angle)
+    const phiRad = deg2rad(Math.max(5, phi));
+    const shadowDrop = distanceFromWindow / Math.tan(phiRad);
+
+    // Reduce effectiveness proportionally based on how much shadow misses the window
+    // At 1.5m overhang (max), shadow drop is significant at low profile angles
+    const dropFactor = Math.max(0, 1 - shadowDrop / (windowH * 1.5));
+    shadingFraction *= dropFactor;
+  }
+
+  return Math.max(0, Math.min(1, shadingFraction));
 }
 
 export function cardinalFromAzimuth(azimuthDeg) {
@@ -771,6 +1395,21 @@ export function planeIrradianceVertical({
   return { I_beam, I_diff, I_gnd };
 }
 
+export function planeIrradianceHorizontalUp({
+  altitudeDeg,
+  DNI,
+  DHI,
+}) {
+  if (altitudeDeg <= 0) {
+    return { I_beam: 0, I_diff: 0, I_gnd: 0 };
+  }
+  const sinAlt = Math.max(0, Math.sin(deg2rad(altitudeDeg)));
+  const I_beam = DNI * sinAlt;
+  const I_diff = DHI;
+  const I_gnd = 0;
+  return { I_beam, I_diff, I_gnd };
+}
+
 /* -------------------- Thermal engine -------------------- */
 export function computeSnapshot(params) {
   const {
@@ -787,6 +1426,7 @@ export function computeSnapshot(params) {
     blindsReduction,
     g_glass,
     achTotal = ACH_INFILTRATION_DEFAULT,
+    heatRecoveryEfficiency = 0,
     T_out,
     Q_internal,
     latitude,
@@ -796,10 +1436,12 @@ export function computeSnapshot(params) {
     T_room_override,
     weatherRadiation,
     timezoneHours = 0,
+    rooflight,
   } = params;
 
   const volume = width * depth * height;
-  const UA_vent = (RHO_AIR * CP_AIR * achTotal * volume) / 3600;
+  const hrEff = Math.max(0, Math.min(1, heatRecoveryEfficiency || 0));
+  const UA_vent = ((RHO_AIR * CP_AIR * achTotal * volume) / 3600) * (1 - hrEff);
 
   const solarDateUtc = toSolarUtcDate(dateMidday, timezoneHours);
   const { altitude, azimuth } = solarPosition(solarDateUtc, latitude, longitude);
@@ -816,6 +1458,12 @@ export function computeSnapshot(params) {
   };
 
   let A_window_total = 0;
+  const rooflightAreaM2 = Math.max(
+    0,
+    Number.isFinite(rooflight?.areaM2) ? rooflight.areaM2 : 0,
+  );
+  const rooflightUValue = Number.isFinite(rooflight?.uValue) ? rooflight.uValue : U_window;
+  const rooflightGValue = Number.isFinite(rooflight?.gValue) ? rooflight.gValue : g_glass;
   let Q_solar = 0;
   const Q_solar_byFace = { north: 0, south: 0, east: 0, west: 0 };
   const I_beam_byFace = { north: 0, south: 0, east: 0, west: 0 };
@@ -832,8 +1480,8 @@ export function computeSnapshot(params) {
     });
 
     const fracOverhang = overhangShadingFraction(w.h, w.overhangDepth || 0, altitude, azimuth, w.az);
-    const fracVFins = finsShadingFraction(w.w, w.finDepth || 0, azimuth, w.az);
-    const fracHFins = horizontalFinsShadingFraction(w.h, w.hFinDepth || 0, altitude, azimuth, w.az);
+    const fracVFins = finsShadingFraction(w.h, w.finDepth || 0, azimuth, w.az, w.overhangDepth || 0, altitude);
+    const fracHFins = horizontalFinsShadingFraction(w.h, w.hFinDepth || 0, altitude, azimuth, w.az, w.overhangDepth || 0);
     const fracExt = Math.max(0, Math.min(1, 1 - (1 - fracOverhang) * (1 - fracVFins) * (1 - fracHFins)));
 
     const I_beam_shaded = I_beam * (1 - fracExt);
@@ -856,21 +1504,35 @@ export function computeSnapshot(params) {
     }
   });
 
+  let Q_solar_rooflight = 0;
+  if (rooflightAreaM2 > 1e-6) {
+    const { I_beam, I_diff, I_gnd } = planeIrradianceHorizontalUp({
+      altitudeDeg: altitude,
+      DNI,
+      DHI,
+    });
+    const I_total_rooflight = I_beam + I_diff + I_gnd;
+    Q_solar_rooflight = I_total_rooflight * rooflightGValue * rooflightAreaM2;
+    Q_solar += Q_solar_rooflight;
+  }
+
   const A_opaque = Object.values(wallAreas).reduce((acc, area) => acc + Math.max(0, area), 0);
   const A_floor = width * depth;
-  const A_roof = A_floor;
+  const A_roof = Math.max(0, A_floor - rooflightAreaM2);
 
   const UA_walls = U_wall * A_opaque;
   const UA_windows = U_window * A_window_total;
+  const UA_rooflight = rooflightUValue * rooflightAreaM2;
   const UA_roof = U_roof * A_roof;
   const UA_floor = U_floor * A_floor;
-  const UA_out = UA_walls + UA_windows + UA_roof + UA_floor;
+  const UA_out = UA_walls + UA_windows + UA_rooflight + UA_roof + UA_floor;
   const T_room_steady = T_out + (Q_solar + Q_internal) / ((UA_out + UA_vent) || 1e-6);
   const T_room = Number.isFinite(T_room_override) ? T_room_override : T_room_steady;
 
   const dT = T_room - T_out;
   const Q_loss_walls = UA_walls * dT;
   const Q_loss_windows = UA_windows * dT;
+  const Q_loss_rooflight = UA_rooflight * dT;
   const Q_loss_roof = UA_roof * dT;
   const Q_loss_floor = UA_floor * dT;
   const Q_loss_fabric = UA_out * dT;
@@ -894,19 +1556,23 @@ export function computeSnapshot(params) {
     DHI,
     GHI,
     A_window_total,
+    A_rooflight: rooflightAreaM2,
     A_opaque,
     A_floor,
     A_roof,
     UA_components: {
       walls: UA_walls,
       windows: UA_windows,
+      rooflight: UA_rooflight,
       roof: UA_roof,
       floor: UA_floor,
     },
     Q_loss_walls,
     Q_loss_windows,
+    Q_loss_rooflight,
     Q_loss_roof,
     Q_loss_floor,
+    Q_solar_rooflight,
     Q_loss_fabric,
     Q_loss_vent,
     Q_loss_total,
@@ -959,6 +1625,9 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
   const thermalCapacitance = options.thermalCapacitance ?? THERMAL_CAPACITANCE_J_PER_K;
   const comfortBand = options.comfortBand ?? COMFORT_BAND;
   const achTotalPreset = options.achTotal ?? ACH_INFILTRATION_DEFAULT;
+  const heatRecoveryEfficiencyPreset = options.heatRecoveryEfficiency ?? 0;
+  const manualOpenAchFixed = Math.max(0, options.manualOpenAch ?? 0);
+  const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
   const adaptiveVentEnabled = options.adaptiveVentEnabled ?? false;
   const startIndoorTemp = options.startIndoorTemp;
@@ -972,7 +1641,7 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
   const evaluateStep = (time, indoorTemp, ventActivePrev, shouldLogTransitions = false) => {
     const forcing = forcingAt(time, weatherProvider);
     const hourOfDay = time.getUTCHours();
-    const vent = adaptiveVentEnabled
+    const baseVent = adaptiveVentEnabled
       ? adaptiveVentilationStateForStep({
           indoorTemp,
           outdoorTemp: forcing.T_out,
@@ -984,6 +1653,33 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
           hourOfDay,
           nightPurgeEnabled,
         });
+    const manualVent = manualVentilationInput
+      ? calculateManualWindowVentilation(
+          manualVentilationInput.openedWindowArea,
+          manualVentilationInput.volume,
+          {
+            roofOpeningAreaM2: manualVentilationInput.roofOpeningAreaM2,
+            roomHeightM: manualVentilationInput.roomHeightM ?? params.height,
+            stackHeightM: manualVentilationInput.stackHeightM,
+            windMS: Number.isFinite(manualVentilationInput.fixedWindMS)
+              ? manualVentilationInput.fixedWindMS
+              : forcing.windMS,
+            indoorTempC: indoorTemp,
+            outdoorTempC: forcing.T_out,
+          },
+        )
+      : null;
+    const manualOpenAch = manualVent?.manualOpenAch ?? manualOpenAchFixed;
+    const achTotal = baseVent.achTotal + manualOpenAch;
+    const achWindow = Math.max(0, achTotal - ACH_INFILTRATION_DEFAULT);
+    const vent = {
+      ...baseVent,
+      achTotal,
+      achWindow,
+      ventActive: achWindow > 0,
+      manualOpenAch,
+      manualVentilation: manualVent,
+    };
 
     if (shouldLogTransitions && vent.ventActive !== ventActivePrev) {
       console.info(
@@ -991,11 +1687,18 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       );
     }
 
+    // Heat recovery only applies to mechanical ventilation, not window-based ventilation
+    // Disable HR when: adaptive mode, manual windows open, or night purge active
+    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
+    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+
     const snapshot = computeSnapshot({
       ...params,
       dateMidday: time,
       T_out: forcing.T_out,
       achTotal: vent.achTotal,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         forcing.source === "epw"
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }
@@ -1048,6 +1751,8 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       ventActive: step.vent.ventActive,
       achWindow: step.vent.achWindow,
       achTotal: step.vent.achTotal,
+      manualOpenAch: step.vent.manualOpenAch,
+      manualVentilationMode: step.vent.manualVentilation?.mode,
       adaptiveReason: step.vent.adaptiveReason,
       illuminanceLux: step.snapshot.illuminanceLux,
     });
@@ -1063,6 +1768,9 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
   const comfortBand = options.comfortBand ?? COMFORT_BAND;
   const thermalCapacitance = options.thermalCapacitance ?? THERMAL_CAPACITANCE_J_PER_K;
   const achTotalPreset = options.achTotal ?? ACH_INFILTRATION_DEFAULT;
+  const heatRecoveryEfficiencyPreset = options.heatRecoveryEfficiency ?? 0;
+  const manualOpenAchFixed = Math.max(0, options.manualOpenAch ?? 0);
+  const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
   const adaptiveVentEnabled = options.adaptiveVentEnabled ?? false;
   const spinupHours = options.spinupHours ?? 7 * 24;
@@ -1072,9 +1780,9 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
   const weekHours = 24 * 7;
   const weekCount = Math.ceil(totalHours / weekHours);
 
-  const evaluateStep = (time, indoorTemp, ventActivePrev) => {
+  const evaluateStep = (time, indoorTemp) => {
     const forcing = forcingAt(time, weatherProvider);
-    const vent = adaptiveVentEnabled
+    const baseVent = adaptiveVentEnabled
       ? adaptiveVentilationStateForStep({
           indoorTemp,
           outdoorTemp: forcing.T_out,
@@ -1086,11 +1794,46 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
           hourOfDay: time.getUTCHours(),
           nightPurgeEnabled,
         });
+    const manualVent = manualVentilationInput
+      ? calculateManualWindowVentilation(
+          manualVentilationInput.openedWindowArea,
+          manualVentilationInput.volume,
+          {
+            roofOpeningAreaM2: manualVentilationInput.roofOpeningAreaM2,
+            roomHeightM: manualVentilationInput.roomHeightM ?? params.height,
+            stackHeightM: manualVentilationInput.stackHeightM,
+            windMS: Number.isFinite(manualVentilationInput.fixedWindMS)
+              ? manualVentilationInput.fixedWindMS
+              : forcing.windMS,
+            indoorTempC: indoorTemp,
+            outdoorTempC: forcing.T_out,
+          },
+        )
+      : null;
+    const manualOpenAch = manualVent?.manualOpenAch ?? manualOpenAchFixed;
+    const achTotal = baseVent.achTotal + manualOpenAch;
+    const achWindow = Math.max(0, achTotal - ACH_INFILTRATION_DEFAULT);
+    const vent = {
+      ...baseVent,
+      achTotal,
+      achWindow,
+      ventActive: achWindow > 0,
+      manualOpenAch,
+      manualVentilation: manualVent,
+    };
+
+    // Heat recovery only applies to mechanical ventilation, not window-based ventilation
+    const hourOfDay = time.getUTCHours();
+    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
+    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+
     const snapshot = computeSnapshot({
       ...params,
       dateMidday: time,
       T_out: forcing.T_out,
       achTotal: vent.achTotal,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         forcing.source === "epw"
           ? { DNI: forcing.DNI, DHI: forcing.DHI, GHI: forcing.GHI }
@@ -1107,10 +1850,8 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
   let indoorTemp = Number.isFinite(startIndoorTemp)
     ? startIndoorTemp
     : forcingAt(spinupStart, weatherProvider).T_out;
-  let ventActive = false;
   for (let h = -spinupHours; h < 0; h++) {
-    const step = evaluateStep(dateFromTypicalYearHour(h), indoorTemp, ventActive);
-    ventActive = step.vent.ventActive;
+    const step = evaluateStep(dateFromTypicalYearHour(h), indoorTemp);
     indoorTemp += step.dTdt * dtSeconds;
   }
 
@@ -1134,8 +1875,7 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
 
   for (let hour = 0; hour < totalHours; hour++) {
     const date = dateFromTypicalYearHour(hour);
-    const step = evaluateStep(date, indoorTemp, ventActive);
-    ventActive = step.vent.ventActive;
+    const step = evaluateStep(date, indoorTemp);
 
     const status = classifyComfortState(indoorTemp, comfortBand);
     // Steady-state HVAC: power to maintain setpoint temperature against heat flows

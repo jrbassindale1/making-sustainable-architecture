@@ -14,7 +14,11 @@
       "Bash(git -C /Users/jr-bassindale/room-comfort-sim pull origin main)",
       "Bash(gh run view:*)",
       "Bash(git commit:*)",
-      "Bash(git push)"
+      "Bash(git push)",
+      "Bash(/usr/local/bin/npm run build)",
+      "Bash(/opt/homebrew/bin/npm run build)",
+      "Bash(pnpm run build:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }

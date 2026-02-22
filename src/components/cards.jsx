@@ -67,9 +67,13 @@ export function Metric({ label, value, helper, accent }) {
 }
 
 /* -------------------- Insights -------------------- */
-export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
+export function InsightsCard({ snapshot, faceConfigs, ventilationSummary, dimensions }) {
+  const width = Number.isFinite(dimensions?.width) ? dimensions.width : BUILDING_WIDTH;
+  const depth = Number.isFinite(dimensions?.depth) ? dimensions.depth : BUILDING_DEPTH;
+  const height = Number.isFinite(dimensions?.height) ? dimensions.height : BUILDING_HEIGHT;
   const sunUp = snapshot.altitude > 0;
   const byFace = snapshot.Q_solar_byFace;
+  const totalFacadeSolarGain = Object.values(byFace || {}).reduce((sum, value) => sum + (value || 0), 0);
 
   const sorted = Object.entries(byFace).sort(([, a], [, b]) => b - a);
   const dominantFace = sorted[0];
@@ -78,13 +82,13 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
     ? "The sun is below the horizon right now — slide to daylight to see how each face performs."
     : dominantFace[1] > 0
       ? `The ${dominantFace[0]} face is receiving the most solar gain (${Math.round(dominantFace[1])} W). ` +
-        `Total solar gain across all faces is ${Math.round(snapshot.Q_solar)} W.`
+        `Total solar gain across all faces is ${Math.round(totalFacadeSolarGain)} W.`
       : "No direct solar gain on any face at this time.";
 
   const shadedFaces = FACES.filter(
     (f) =>
       faceConfigs[f.id].glazing > 0 &&
-      (faceConfigs[f.id].overhang > 0.05 || faceConfigs[f.id].fin > 0.05),
+      (faceConfigs[f.id].overhang > 0.1 || faceConfigs[f.id].fin > 0.05),
   );
   const shadingSentence =
     shadedFaces.length === 0
@@ -92,10 +96,10 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
       : `External shading is active on the ${shadedFaces.map((f) => f.label).join(", ")} face${shadedFaces.length > 1 ? "s" : ""}.`;
 
   const totalGlazingArea = FACES.reduce((sum, f) => {
-    const faceSpan = f.id === "east" || f.id === "west" ? BUILDING_DEPTH : BUILDING_WIDTH;
-    return sum + faceSpan * faceConfigs[f.id].glazing * BUILDING_HEIGHT;
+    const faceSpan = f.id === "east" || f.id === "west" ? depth : width;
+    return sum + faceSpan * faceConfigs[f.id].glazing * height;
   }, 0);
-  const totalWallArea = 2 * (BUILDING_WIDTH + BUILDING_DEPTH) * BUILDING_HEIGHT;
+  const totalWallArea = 2 * (width + depth) * height;
   const overallWWR = totalGlazingArea / totalWallArea;
   const glazingSentence = `Overall window-to-wall ratio is ${Math.round(overallWWR * 100)}% (${totalGlazingArea.toFixed(1)} m² of glazing across ${totalWallArea.toFixed(0)} m² of facade).`;
 
@@ -126,7 +130,6 @@ export function InsightsCard({ snapshot, faceConfigs, ventilationSummary }) {
 
 export function OutcomeCard({
   currentPoint,
-  comfortBand,
   timeLabel,
   dateLabel,
   outdoorTemp,
@@ -162,18 +165,31 @@ export function OutcomeCard({
           <p className={`${valueClass} font-semibold ${tempColor}`}>
             {currentPoint.T_in.toFixed(1)}°C
           </p>
+          {compact && (
+            <p className="text-[11px] leading-tight text-slate-500">
+              {dateLabel} · {timeLabel}
+            </p>
+          )}
         </div>
         <div>
           <p className="text-xs font-medium text-slate-500">Outdoor</p>
           <p className={`${valueClass} font-semibold text-blue-600`}>
             {outdoorTemp?.toFixed(1) ?? "—"}°C
           </p>
-          <p className="text-xs text-slate-500">{cloudLabel}</p>
+          {compact ? (
+            <p className="text-[11px] leading-tight text-slate-500">
+              {cloudLabel}
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500">{cloudLabel}</p>
+          )}
         </div>
       </div>
-      <p className="text-xs text-slate-500">
-        {dateLabel} · {timeLabel}
-      </p>
+      {!compact && (
+        <p className="text-xs text-slate-500">
+          {dateLabel} · {timeLabel}
+        </p>
+      )}
     </Card>
   );
 }
@@ -418,13 +434,16 @@ export function CostCarbonCard({ title, periodLabel, summary }) {
           <p>{formatGBP(summary.standingCost)}</p>
         </div>
       </div>
-      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
-        <span>Total cost</span>
-        <span className="font-semibold">{formatGBP(summary.totalCost)}</span>
+      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
+        <span className="text-xs">Total cost</span>
+        <span>
+          <span className="text-lg font-bold">{formatGBP(summary.energyCost)}</span>
+          <span className="text-[10px] text-slate-500"> (+{formatGBP(summary.standingCost)})</span>
+        </span>
       </div>
-      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
-        <span>Carbon impact</span>
-        <span className="font-semibold">{formatKg(summary.carbonKg)}</span>
+      <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
+        <span className="text-xs">Carbon emissions</span>
+        <span className="text-lg font-bold">{formatKg(summary.carbonKg)}</span>
       </div>
     </Card>
   );

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   LineChart,
@@ -44,9 +44,19 @@ import {
   U_VALUE_PRESET_ORDER,
   VENTILATION_PRESETS,
   VENTILATION_PRESET_ORDER,
+  WEATHER_FILE_URL,
   LUX_THRESHOLDS,
+  MIN_WINDOW_CLEAR_HEIGHT,
+  ROOFLIGHT_MAX_EDGE_OFFSET_M,
+  ROOFLIGHT_MIN_CLEAR_SPAN_M,
+  WINDOW_SEGMENT_STATE,
+  WINDOW_OPEN_TRAVEL_M,
+  assessVentilationComfort,
   buildPreviewFaceConfigs,
+  calculateManualWindowVentilation,
   calculateOpeningArea,
+  calculateOpenedWindowArea,
+  clampWindowCenterRatio,
   buildWindowsFromFaceState,
   cardinalFromAzimuth,
   computeCostCarbonSummary,
@@ -60,12 +70,17 @@ import {
   formatMonthDayTime,
   isNightHour,
   normalizedAzimuth,
+  nextWindowSegmentState,
+  normalizeWindowSegmentState,
+  resolveRooflightConfig,
+  resolveWindowOpeningHeight,
   simulateAnnual1R1C,
   simulateDay1R1C,
   WINTER_SOLSTICE_DAY,
   SPRING_EQUINOX_DAY,
   AUTUMN_EQUINOX_DAY,
 } from "@/engine";
+import { loadEpwDataset } from "@/weather/parseEpw";
 import {
   ComfortGuidanceCard,
   CostCarbonCard,
@@ -81,25 +96,88 @@ import {
 } from "@/components/cards";
 
 const MIDDAY_TIME_FRAC = 0.5;
+const GLASS_G_VALUE = 0.4;
+const DOWNLIGHTS_OFF_HOUR = 23;
+const DOWNLIGHTS_PRE_SUNRISE_HOURS = 1; // Turn on this many hours before sunrise
+const DOWNLIGHT_INTENSITY_DEFAULT = 60;
+const DOWNLIGHT_BEAM_ANGLE_DEFAULT = 0.95;
+const DOWNLIGHT_PENUMBRA_DEFAULT = 1;
+const DOWNLIGHT_THROW_SCALE_DEFAULT = 2.5;
+const DOWNLIGHT_SOURCE_GLOW_DEFAULT = 2.5;
+const STANDARD_SW_WIND_MPH = 5;
+const STANDARD_SW_WIND_MS = STANDARD_SW_WIND_MPH * 0.44704;
+const STANDARD_SW_WIND_DIR_DEG = 225;
+const PNG_EXPORT_RENDER_SETTLE_MS = 900;
+const PASSIVHAUS_U_VALUE_PRESET = "passivhaus";
+const PASSIVHAUS_VENTILATION_PRESET = "passivhaus";
+const PASSIVHAUS_FACE_STATE = {
+  north: { glazing: 0.16, overhang: 0, fin: 0, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  east: { glazing: 0.18, overhang: 0, fin: 0.5, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  south: { glazing: 0.34, overhang: 0.9, fin: 0, hFin: 0.45, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+  west: { glazing: 0.18, overhang: 0, fin: 0.5, hFin: 0, cillLift: 0.8, headDrop: 0.6, windowCenterRatio: 0 },
+};
+const windowSegmentStateLabel = (state) => {
+  if (state === WINDOW_SEGMENT_STATE.TOP_HUNG) return "top_hung";
+  if (state === WINDOW_SEGMENT_STATE.TURN) return "turn";
+  return "closed";
+};
+const getAnalyticsErrorMessage = (error) => {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "Unknown error";
+};
 
 export default function App() {
   const initialSolsticeDay =
     DEFAULT_SITE.latitude >= 0 ? SUMMER_SOLSTICE_DAY : WINTER_SOLSTICE_DAY;
   const [faceState, setFaceState] = useState({
-    north: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0 },
-    east: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0 },
-    south: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0 },
-    west: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0 },
+    north: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0, cillLift: 0, headDrop: 0, windowCenterRatio: 0 },
+    east: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0, cillLift: 0, headDrop: 0, windowCenterRatio: 0 },
+    south: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0, cillLift: 0, headDrop: 0, windowCenterRatio: 0 },
+    west: { glazing: 0.5, overhang: 0, fin: 0, hFin: 0, cillLift: 0, headDrop: 0, windowCenterRatio: 0 },
   });
 
   const updateFace = (faceId, field, value) => {
-    setFaceState((prev) => ({
-      ...prev,
-      [faceId]: { ...prev[faceId], [field]: value },
-    }));
+    setFaceState((prev) => {
+      const current = prev[faceId];
+      if (!current) return prev;
+      const next = { ...current, [field]: value };
+      if (field === "glazing") {
+        const glazing = Math.max(0, Math.min(0.8, value));
+        next.glazing = glazing;
+        next.windowCenterRatio = clampWindowCenterRatio(glazing, current.windowCenterRatio ?? 0);
+      } else if (field === "windowCenterRatio") {
+        next.windowCenterRatio = clampWindowCenterRatio(current.glazing ?? 0, value);
+      } else if (field === "fin" && value > 0) {
+        // Vertical and horizontal fins are mutually exclusive
+        next.hFin = 0;
+      } else if (field === "hFin" && value > 0) {
+        // Vertical and horizontal fins are mutually exclusive
+        next.fin = 0;
+      }
+      return { ...prev, [faceId]: next };
+    });
   };
 
   const [orientationDeg, setOrientationDeg] = useState(0);
+  const [weatherMode, setWeatherMode] = useState("synthetic");
+  const [epwDataset, setEpwDataset] = useState(null);
+  const [epwLoadError, setEpwLoadError] = useState("");
+  const [buildingWidth, setBuildingWidth] = useState(BUILDING_WIDTH);
+  const [buildingDepth, setBuildingDepth] = useState(BUILDING_DEPTH);
+  const [buildingHeight, setBuildingHeight] = useState(BUILDING_HEIGHT);
+  const [openWindowSegments, setOpenWindowSegments] = useState({});
+  const [rooflightState, setRooflightState] = useState({
+    width: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+    depth: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+    openHeight: 0,
+  });
+  const [rooflightEnabled, setRooflightEnabled] = useState(true);
+  const downlightIntensity = DOWNLIGHT_INTENSITY_DEFAULT;
+  const downlightBeamAngle = DOWNLIGHT_BEAM_ANGLE_DEFAULT;
+  const downlightPenumbra = DOWNLIGHT_PENUMBRA_DEFAULT;
+  const downlightThrowScale = DOWNLIGHT_THROW_SCALE_DEFAULT;
+  const downlightSourceGlow = DOWNLIGHT_SOURCE_GLOW_DEFAULT;
   const [viewMode, setViewMode] = useState("explore");
   const [exploreTab, setExploreTab] = useState("context");
   const [ventilationPreset, setVentilationPreset] = useState(DEFAULT_VENTILATION_PRESET);
@@ -111,10 +189,62 @@ export default function App() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportingPngs, setExportingPngs] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [forceLowPerfModel, setForceLowPerfModel] = useState(false);
+  const [autoLowPerfModel, setAutoLowPerfModel] = useState(false);
   const mainCaptureRef = useRef(null);
   const moreDetailsRef = useRef(null);
   const dailyChartContainerRef = useRef(null);
   const [dailyChartSize, setDailyChartSize] = useState({ width: 0, height: 0 });
+  const lowPerfModelActive = forceLowPerfModel || autoLowPerfModel;
+  const trackAnalyticsEvent = useCallback((eventName, params = {}) => {
+    if (typeof window === "undefined" || typeof window.gtag !== "function") return;
+    const analyticsParams = import.meta.env.DEV
+      ? { debug_mode: true, ...params }
+      : params;
+    window.gtag("event", eventName, analyticsParams);
+  }, []);
+
+  useEffect(() => {
+    trackAnalyticsEvent("app_loaded", {
+      app_area: "room_comfort_sim",
+      initial_view_mode: "explore",
+      initial_weather_mode: "synthetic",
+    });
+  }, [trackAnalyticsEvent]);
+
+  useEffect(() => {
+    if (!exportingVideo || typeof document === "undefined") return;
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }, [exportingVideo]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadEpwDataset(WEATHER_FILE_URL)
+      .then((dataset) => {
+        if (cancelled) return;
+        setEpwDataset(dataset);
+        setEpwLoadError("");
+        trackAnalyticsEvent("weather_epw_loaded", {
+          location_name: dataset?.meta?.name ?? "unknown",
+          timezone_hours: Number(dataset?.meta?.tzHours ?? 0),
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn("[Weather] EPW load failed, synthetic weather remains active:", error);
+        setEpwLoadError(error?.message ?? "Unable to load EPW dataset.");
+        trackAnalyticsEvent("weather_epw_load_failed", {
+          error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [trackAnalyticsEvent]);
 
   const faceFacingLabel = (face) => {
     const azimuth = normalizedAzimuth(face.azimuth + orientationDeg);
@@ -124,12 +254,53 @@ export default function App() {
     return `${cardinalLabel} (${Math.round(azimuth)}°)`;
   };
 
-  const effectiveWeatherMode = "synthetic";
-  const weatherMeta = DEFAULT_SITE;
+  const epwAvailable = Boolean(epwDataset);
+  const epwLoading = !epwDataset && !epwLoadError;
+  const effectiveWeatherMode =
+    weatherMode === "epw" && epwAvailable ? "epw" : "synthetic";
+  const buildAnalyticsContext = useCallback(
+    () => ({
+      view_mode: viewMode,
+      explore_tab: exploreTab,
+      weather_mode: effectiveWeatherMode,
+      orientation_deg: Math.round(orientationDeg),
+      u_value_preset: uValuePreset,
+      ventilation_preset: ventilationPreset,
+      night_purge: nightPurgeEnabled ? "on" : "off",
+      rooflight_enabled: rooflightEnabled ? "on" : "off",
+      manual_open_sashes: Object.keys(openWindowSegments).length,
+    }),
+    [
+      effectiveWeatherMode,
+      exploreTab,
+      nightPurgeEnabled,
+      openWindowSegments,
+      orientationDeg,
+      rooflightEnabled,
+      uValuePreset,
+      ventilationPreset,
+      viewMode,
+    ],
+  );
+  const weatherMeta = useMemo(() => {
+    if (effectiveWeatherMode !== "epw" || !epwDataset?.meta) {
+      return DEFAULT_SITE;
+    }
+    return {
+      name: epwDataset.meta.name,
+      latitude: epwDataset.meta.lat,
+      longitude: epwDataset.meta.lon,
+      tzHours: epwDataset.meta.tzHours,
+      elevationM: epwDataset.meta.elevationM,
+    };
+  }, [effectiveWeatherMode, epwDataset]);
 
   const weatherSummary = useMemo(() => {
-    return "Simplified (Pencilli - Brecon)";
-  }, []);
+    if (effectiveWeatherMode === "epw") {
+      return `EPW weather (${weatherMeta.name})`;
+    }
+    return "Simplified synthetic (Pencelli - Brecon)";
+  }, [effectiveWeatherMode, weatherMeta.name]);
 
   const seasonalMarks = useMemo(() => {
     const isNorthern = weatherMeta.latitude >= 0;
@@ -146,8 +317,11 @@ export default function App() {
   }, [weatherMeta.latitude]);
 
   const weatherDescription = useMemo(() => {
-    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencilli - Brecon.";
-  }, []);
+    if (effectiveWeatherMode === "epw") {
+      return "Measured hourly dry-bulb, solar radiation, and cloud cover from the EPW file.";
+    }
+    return "Simplified seasonal temperature curve plus clear-sky sunlight for Pencelli - Brecon.";
+  }, [effectiveWeatherMode]);
 
   useEffect(() => {
     const node = dailyChartContainerRef.current;
@@ -167,7 +341,39 @@ export default function App() {
     const observer = new ResizeObserver(() => updateSize());
     observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [viewMode]);
+
+  useEffect(() => {
+    const maxTotal = Math.max(0, buildingHeight - MIN_WINDOW_CLEAR_HEIGHT);
+    setFaceState((prev) => {
+      let changed = false;
+      const next = { ...prev };
+
+      FACES.forEach((face) => {
+        const current = prev[face.id];
+        if (!current) return;
+        let cillLift = Math.max(0, Math.min(current.cillLift ?? 0, maxTotal));
+        let headDrop = Math.max(0, Math.min(current.headDrop ?? 0, maxTotal));
+
+        if (cillLift + headDrop > maxTotal) {
+          const overflow = cillLift + headDrop - maxTotal;
+          if (headDrop >= overflow) {
+            headDrop -= overflow;
+          } else {
+            cillLift = Math.max(0, cillLift - (overflow - headDrop));
+            headDrop = 0;
+          }
+        }
+
+        if (cillLift !== (current.cillLift ?? 0) || headDrop !== (current.headDrop ?? 0)) {
+          changed = true;
+          next[face.id] = { ...current, cillLift, headDrop };
+        }
+      });
+
+      return changed ? next : prev;
+    });
+  }, [buildingHeight]);
 
   const activeUPreset = useMemo(
     () => U_VALUE_PRESETS[uValuePreset] ?? U_VALUE_PRESETS[DEFAULT_U_VALUE_PRESET],
@@ -181,6 +387,7 @@ export default function App() {
     [ventilationPreset],
   );
   const ventilationAchTotal = activeVentPreset.achTotal;
+  const ventilationHeatRecovery = activeVentPreset.heatRecoveryEfficiency ?? 0;
   const adaptiveVentEnabled = activeVentPreset.isAdaptive === true;
 
   const selectedDate = useMemo(() => dateFromDayOfYearUTC(dayOfYear), [dayOfYear]);
@@ -207,40 +414,274 @@ export default function App() {
   const effectiveSpinupDays = SIMULATION_SPINUP_DAYS;
 
   const windows = useMemo(
-    () => buildWindowsFromFaceState(faceState, orientationDeg),
-    [faceState, orientationDeg],
+    () =>
+      buildWindowsFromFaceState(faceState, orientationDeg, {
+        width: buildingWidth,
+        depth: buildingDepth,
+        height: buildingHeight,
+      }),
+    [faceState, orientationDeg, buildingWidth, buildingDepth, buildingHeight],
   );
   const previewFaceConfigs = useMemo(
-    () => buildPreviewFaceConfigs(faceState),
-    [faceState],
+    () =>
+      buildPreviewFaceConfigs(faceState, {
+        height: buildingHeight,
+      }),
+    [faceState, buildingHeight],
   );
   const totalGlazingArea = useMemo(
-    () =>
-      FACES.reduce((sum, f) => {
-        const faceSpan = f.id === "east" || f.id === "west" ? BUILDING_DEPTH : BUILDING_WIDTH;
-        return sum + faceSpan * faceState[f.id].glazing * BUILDING_HEIGHT;
-      }, 0),
-    [faceState],
+    () => windows.reduce((sum, window) => sum + window.w * window.h, 0),
+    [windows],
   );
-  const totalWallArea = 2 * (BUILDING_WIDTH + BUILDING_DEPTH) * BUILDING_HEIGHT;
+  const totalWallArea = 2 * (buildingWidth + buildingDepth) * buildingHeight;
   const overallWWR = totalGlazingArea / totalWallArea;
+  const faceWWR = useMemo(
+    () =>
+      FACES.reduce((acc, face) => {
+        const faceSpan = face.id === "east" || face.id === "west" ? buildingDepth : buildingWidth;
+        const config = faceState[face.id] ?? {};
+        const opening = resolveWindowOpeningHeight(
+          buildingHeight,
+          config.cillLift,
+          config.headDrop,
+          MIN_WINDOW_CLEAR_HEIGHT,
+        );
+        const glazing = Math.max(0, Math.min(0.8, config.glazing ?? 0));
+        const glazedArea = faceSpan * glazing * opening.effectiveHeight;
+        const wallArea = faceSpan * buildingHeight;
+        acc[face.id] = wallArea > 0 ? glazedArea / wallArea : 0;
+        return acc;
+      }, {}),
+    [faceState, buildingWidth, buildingDepth, buildingHeight],
+  );
+  const buildingFloorArea = buildingWidth * buildingDepth;
+  const buildingVolume = buildingFloorArea * buildingHeight;
+  const rooflightSpec = useMemo(
+    () => resolveRooflightConfig(rooflightState, { width: buildingWidth, depth: buildingDepth }),
+    [rooflightState, buildingWidth, buildingDepth],
+  );
+  const effectiveRooflightOpenHeight = rooflightEnabled ? rooflightSpec.openHeight : 0;
+  const effectiveRooflightOpeningAreaM2 = rooflightEnabled ? rooflightSpec.openingAreaM2 : 0;
+  const rooflightThermalProps = useMemo(
+    () => ({
+      areaM2: rooflightEnabled ? Math.max(0, rooflightSpec.width * rooflightSpec.depth) : 0,
+      uValue: activeUValues.window,
+      gValue: GLASS_G_VALUE,
+    }),
+    [rooflightEnabled, rooflightSpec.width, rooflightSpec.depth, activeUValues.window],
+  );
+  const hasRooflightOpen = rooflightEnabled && rooflightSpec.isOpen;
+  const rooflightSizeLimits = useMemo(
+    () => ({ minSize: ROOFLIGHT_MIN_CLEAR_SPAN_M, maxWidth: rooflightSpec.maxWidth, maxDepth: rooflightSpec.maxDepth }),
+    [rooflightSpec.maxWidth, rooflightSpec.maxDepth],
+  );
+  const openedWindowArea = useMemo(
+    () =>
+      calculateOpenedWindowArea(
+        faceState,
+        {
+          width: buildingWidth,
+          depth: buildingDepth,
+          height: buildingHeight,
+        },
+        openWindowSegments,
+      ),
+    [faceState, buildingWidth, buildingDepth, buildingHeight, openWindowSegments],
+  );
+  const manualVentilationInput = useMemo(
+    () => ({
+      openedWindowArea,
+      volume: buildingVolume,
+      roofOpeningAreaM2: effectiveRooflightOpeningAreaM2,
+      roomHeightM: buildingHeight,
+      fixedWindMS: STANDARD_SW_WIND_MS,
+      fixedWindDirDeg: STANDARD_SW_WIND_DIR_DEG,
+    }),
+    [openedWindowArea, buildingVolume, effectiveRooflightOpeningAreaM2, buildingHeight],
+  );
+  const hasManualOpenWindows = openedWindowArea.openLeafCount > 0;
+  const hasManualOpenings = hasManualOpenWindows || hasRooflightOpen;
+
+  const applyPassivhausOverride = useCallback(() => {
+    setUValuePreset(PASSIVHAUS_U_VALUE_PRESET);
+    setVentilationPreset(PASSIVHAUS_VENTILATION_PRESET);
+    setNightPurgeEnabled(true);
+    setFaceState({
+      north: { ...PASSIVHAUS_FACE_STATE.north },
+      east: { ...PASSIVHAUS_FACE_STATE.east },
+      south: { ...PASSIVHAUS_FACE_STATE.south },
+      west: { ...PASSIVHAUS_FACE_STATE.west },
+    });
+    setOpenWindowSegments({});
+    setRooflightEnabled(false);
+    setRooflightState({
+      width: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+      depth: ROOFLIGHT_MIN_CLEAR_SPAN_M,
+      openHeight: 0,
+    });
+    trackAnalyticsEvent("passivhaus_override_applied", {
+      ...buildAnalyticsContext(),
+      preset_id: PASSIVHAUS_U_VALUE_PRESET,
+    });
+  }, [buildAnalyticsContext, trackAnalyticsEvent]);
 
   const setOverallGlazing = (value) => {
     const clamped = Math.max(0, Math.min(0.8, value));
     setFaceState((prev) => {
       const next = { ...prev };
       FACES.forEach((face) => {
-        next[face.id] = { ...prev[face.id], glazing: clamped };
+        next[face.id] = {
+          ...prev[face.id],
+          glazing: clamped,
+          windowCenterRatio: clampWindowCenterRatio(
+            clamped,
+            prev[face.id]?.windowCenterRatio ?? 0,
+          ),
+        };
       });
       return next;
     });
   };
+  const handlePreviewFaceGlazingResize = useCallback((faceId, payload) => {
+    setFaceState((prev) => {
+      const current = prev[faceId];
+      if (!current) return prev;
+      const currentGlazing = Math.max(0, Math.min(0.8, current.glazing ?? 0));
+      const currentCenter = clampWindowCenterRatio(
+        currentGlazing,
+        current.windowCenterRatio ?? 0,
+      );
+      const nextGlazingRaw =
+        typeof payload === "number" ? payload : payload?.glazing ?? currentGlazing;
+      const nextGlazing = Math.max(0, Math.min(0.8, nextGlazingRaw));
+      const nextCenterRaw =
+        payload && typeof payload === "object" && Number.isFinite(payload.centerRatio)
+          ? payload.centerRatio
+          : currentCenter;
+      const nextCenter = clampWindowCenterRatio(nextGlazing, nextCenterRaw);
+      if (
+        Math.abs(currentGlazing - nextGlazing) < 1e-4 &&
+        Math.abs(currentCenter - nextCenter) < 1e-4
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [faceId]: { ...current, glazing: nextGlazing, windowCenterRatio: nextCenter },
+      };
+    });
+  }, []);
+
+  const handleFaceCillLiftChange = (faceId, nextValue) => {
+    const maxTotal = Math.max(0, buildingHeight - MIN_WINDOW_CLEAR_HEIGHT);
+    setFaceState((prev) => {
+      const current = prev[faceId];
+      if (!current) return prev;
+      const cillLift = Math.max(0, Math.min(nextValue, maxTotal));
+      const maxHeadDrop = Math.max(0, maxTotal - cillLift);
+      const headDrop = Math.max(0, Math.min(current.headDrop ?? 0, maxHeadDrop));
+      return { ...prev, [faceId]: { ...current, cillLift, headDrop } };
+    });
+  };
+
+  const handleFaceHeadDropChange = (faceId, nextValue) => {
+    const maxTotal = Math.max(0, buildingHeight - MIN_WINDOW_CLEAR_HEIGHT);
+    setFaceState((prev) => {
+      const current = prev[faceId];
+      if (!current) return prev;
+      const headDrop = Math.max(0, Math.min(nextValue, maxTotal));
+      const maxCillLift = Math.max(0, maxTotal - headDrop);
+      const cillLift = Math.max(0, Math.min(current.cillLift ?? 0, maxCillLift));
+      return { ...prev, [faceId]: { ...current, cillLift, headDrop } };
+    });
+  };
+
+  useEffect(() => {
+    setRooflightState((prev) => {
+      const resolved = resolveRooflightConfig(prev, {
+        width: buildingWidth,
+        depth: buildingDepth,
+      });
+      const next = {
+        width: resolved.width,
+        depth: resolved.depth,
+        openHeight: resolved.openHeight,
+      };
+      if (
+        Math.abs(next.width - prev.width) < 1e-6 &&
+        Math.abs(next.depth - prev.depth) < 1e-6 &&
+        Math.abs(next.openHeight - prev.openHeight) < 1e-6
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [buildingWidth, buildingDepth]);
+
+  const handleRooflightSizeChange = (axis, nextValue) => {
+    setRooflightState((prev) => {
+      const resolved = resolveRooflightConfig(
+        { ...prev, [axis]: nextValue },
+        { width: buildingWidth, depth: buildingDepth },
+      );
+      return {
+        width: resolved.width,
+        depth: resolved.depth,
+        openHeight: resolved.openHeight,
+      };
+    });
+  };
+
+  const toggleRooflightOpen = useCallback(() => {
+    if (!rooflightEnabled) return;
+    const nextOpenHeight = rooflightState.openHeight > 0.001 ? 0 : WINDOW_OPEN_TRAVEL_M;
+    setRooflightState((prev) => ({
+      ...prev,
+      openHeight: nextOpenHeight,
+    }));
+    trackAnalyticsEvent("rooflight_open_toggled", {
+      ...buildAnalyticsContext(),
+      open_state: nextOpenHeight > 0.001 ? "open" : "closed",
+      open_height_mm: Math.round(nextOpenHeight * 1000),
+    });
+  }, [buildAnalyticsContext, rooflightEnabled, rooflightState.openHeight, trackAnalyticsEvent]);
+  const handleRooflightEnabledChange = useCallback((enabled) => {
+    setRooflightEnabled(enabled);
+    if (!enabled) {
+      setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
+    }
+    trackAnalyticsEvent("rooflight_enabled_changed", {
+      ...buildAnalyticsContext(),
+      enabled: enabled ? "true" : "false",
+    });
+  }, [buildAnalyticsContext, trackAnalyticsEvent]);
+
+  const toggleWindowSegment = useCallback((faceId, segmentIndex) => {
+    const key = `${faceId}:${segmentIndex}`;
+    const currentState = normalizeWindowSegmentState(openWindowSegments[key]);
+    const nextState = nextWindowSegmentState(currentState);
+    let next = openWindowSegments;
+    if (nextState === WINDOW_SEGMENT_STATE.CLOSED) {
+      next = { ...openWindowSegments };
+      delete next[key];
+    } else {
+      next = { ...openWindowSegments, [key]: nextState };
+    }
+    setOpenWindowSegments(next);
+    trackAnalyticsEvent("window_segment_toggled", {
+      ...buildAnalyticsContext(),
+      face_id: faceId,
+      segment_index: segmentIndex,
+      segment_state: windowSegmentStateLabel(nextState),
+      open_sashes_after: Object.keys(next).length,
+    });
+  }, [buildAnalyticsContext, openWindowSegments, trackAnalyticsEvent]);
 
   const baseParamsTemplate = useMemo(
     () => ({
-      width: BUILDING_WIDTH,
-      depth: BUILDING_DEPTH,
-      height: BUILDING_HEIGHT,
+      width: buildingWidth,
+      depth: buildingDepth,
+      height: buildingHeight,
       U_wall: activeUValues.wall,
       U_window: activeUValues.window,
       U_roof: activeUValues.roof,
@@ -248,14 +689,24 @@ export default function App() {
       autoBlinds: false,
       blindsThreshold: 400,
       blindsReduction: 0.5,
-      g_glass: 0.4, // Low-E glazing (was 0.6 for standard glazing)
+      g_glass: GLASS_G_VALUE, // Low-E glazing (was 0.6 for standard glazing)
+      rooflight: rooflightThermalProps,
       Q_internal: 180,
       latitude: weatherMeta.latitude,
       longitude: weatherMeta.longitude,
       timezoneHours: weatherMeta.tzHours,
       groundAlbedo: 0.25,
     }),
-    [activeUValues, weatherMeta.latitude, weatherMeta.longitude, weatherMeta.tzHours],
+    [
+      activeUValues,
+      weatherMeta.latitude,
+      weatherMeta.longitude,
+      weatherMeta.tzHours,
+      buildingWidth,
+      buildingDepth,
+      buildingHeight,
+      rooflightThermalProps,
+    ],
   );
   const baseParams = useMemo(
     () => ({ ...baseParamsTemplate, windows }),
@@ -265,10 +716,10 @@ export default function App() {
   const weatherProvider = useMemo(
     () => ({
       mode: effectiveWeatherMode,
-      dataset: null,
+      dataset: effectiveWeatherMode === "epw" ? epwDataset : null,
       syntheticProfile: SYNTHETIC_PROFILE,
     }),
-    [effectiveWeatherMode],
+    [effectiveWeatherMode, epwDataset],
   );
 
   const sunWindow = useMemo(
@@ -289,10 +740,22 @@ export default function App() {
         spinupDays: effectiveSpinupDays,
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
+        heatRecoveryEfficiency: ventilationHeatRecovery,
+        manualVentilationInput,
         nightPurgeEnabled,
         adaptiveVentEnabled,
       }),
-    [baseParams, selectedDate, weatherProvider, ventilationAchTotal, nightPurgeEnabled, adaptiveVentEnabled, effectiveSpinupDays],
+    [
+      baseParams,
+      selectedDate,
+      weatherProvider,
+      ventilationAchTotal,
+      ventilationHeatRecovery,
+      manualVentilationInput,
+      nightPurgeEnabled,
+      adaptiveVentEnabled,
+      effectiveSpinupDays,
+    ],
   );
 
   const daySeries = daySimulation.series;
@@ -316,9 +779,83 @@ export default function App() {
   );
   const outdoorTemp = currentForcing.T_out;
   const cloudCover = currentForcing.totalSkyCover; // tenths (0-10), undefined if synthetic
-  const achTotalAtTime = selectedPoint?.achTotal ?? ventilationAchTotal;
+  const indoorTempAtTime = selectedPoint?.T_in ?? outdoorTemp;
+  const manualWindowVentilation = useMemo(
+    () =>
+      calculateManualWindowVentilation(openedWindowArea, buildingVolume, {
+        roofOpeningAreaM2: effectiveRooflightOpeningAreaM2,
+        roomHeightM: buildingHeight,
+        windMS: STANDARD_SW_WIND_MS,
+        indoorTempC: indoorTempAtTime,
+        outdoorTempC: outdoorTemp,
+      }),
+    [
+      openedWindowArea,
+      buildingVolume,
+      effectiveRooflightOpeningAreaM2,
+      buildingHeight,
+      indoorTempAtTime,
+      outdoorTemp,
+    ],
+  );
+  const openedWindowAch = selectedPoint?.manualOpenAch ?? manualWindowVentilation.manualOpenAch;
+  const manualWindowModeText = useMemo(() => {
+    if (!hasManualOpenings) return "none";
+    if (manualWindowVentilation.mode === "roof-only") return "rooflight-only";
+    if (manualWindowVentilation.mode === "cross") {
+      const pairLabel =
+        manualWindowVentilation.activeCrossPair === "north-south"
+          ? "north-south"
+          : manualWindowVentilation.activeCrossPair === "east-west"
+            ? "east-west"
+            : null;
+      return pairLabel ? `cross-ventilation (${pairLabel})` : "cross-ventilation";
+    }
+    if (manualWindowVentilation.mode === "multi-face") return "multi-face";
+    return "single-sided";
+  }, [hasManualOpenings, manualWindowVentilation]);
+  const rooflightVentSummaryText = rooflightEnabled
+    ? `${effectiveRooflightOpeningAreaM2.toFixed(2)} m² @ ${(effectiveRooflightOpenHeight * 1000).toFixed(0)} mm`
+    : "OFF";
+  const manualWindowSummaryText = hasManualOpenings
+    ? ` Manual openings add ${manualWindowVentilation.totalManualOpenAreaM2.toFixed(2)} m² free area (~${openedWindowAch.toFixed(1)} ACH, ${manualWindowModeText}; wind ${(manualWindowVentilation.windMS ?? 0).toFixed(1)} m/s, dT ${(indoorTempAtTime - outdoorTemp).toFixed(1)}°C; windows ${openedWindowArea.totalOpenAreaM2.toFixed(2)} m² [${openedWindowArea.topHungLeafCount} top-hung = ${openedWindowArea.topHungAreaM2.toFixed(2)} m², ${openedWindowArea.turnLeafCount} turn = ${openedWindowArea.turnAreaM2.toFixed(2)} m²], rooflight ${rooflightVentSummaryText}).`
+    : "";
+  const achTotalAtTime = selectedPoint?.achTotal ?? ventilationAchTotal + openedWindowAch;
+  const ventilationComfort = useMemo(
+    () =>
+      assessVentilationComfort({
+        achTotal: achTotalAtTime,
+        indoorTemp: indoorTempAtTime,
+        outdoorTemp,
+      }),
+    [achTotalAtTime, indoorTempAtTime, outdoorTemp],
+  );
+  const comfortStatus = selectedPoint?.status ?? "comfortable";
+  const perceivedComfortStatus =
+    ventilationComfort.perceivedTempC < COMFORT_BAND.min
+      ? "heating"
+      : ventilationComfort.perceivedTempC > COMFORT_BAND.max
+        ? "cooling"
+        : "comfortable";
+  const comfortStatusLabel =
+    comfortStatus === "heating"
+      ? "Below comfort"
+      : comfortStatus === "cooling"
+        ? "Above comfort"
+        : "Within comfort";
+  const showDraftWarning = comfortStatus === "heating" && achTotalAtTime > 6;
+  const perceivedComfortLabel =
+    perceivedComfortStatus === "heating"
+      ? "Below comfort"
+      : perceivedComfortStatus === "cooling"
+        ? "Above comfort"
+        : "Within comfort";
+  const outdoorTemperatureInfoText =
+    effectiveWeatherMode === "epw"
+      ? "Outdoor temperature and cloud cover come from measured hourly EPW weather at this time."
+      : "Outdoor temperature follows a simplified seasonal/day profile and solar assumes clear-sky conditions.";
   const adaptiveReason = selectedPoint?.adaptiveReason;
-  const ventilationLabel = adaptiveVentEnabled
+  const baseVentilationLabel = adaptiveVentEnabled
     ? adaptiveReason === "day-cooling"
       ? "Adaptive (cooling)"
       : adaptiveReason === "night-cooling"
@@ -331,26 +868,54 @@ export default function App() {
     : nightPurgeEnabled && isNightTime
       ? "Night purge"
       : activeVentPreset.label;
+  const ventilationLabel = hasManualOpenings
+    ? `${baseVentilationLabel} + manual openings`
+    : baseVentilationLabel;
   const ventilationSummary = adaptiveVentEnabled
-    ? `Adaptive ventilation: windows open automatically when cooling is beneficial (0.6-6.0 ACH).`
+    ? `Adaptive ventilation: windows open automatically when cooling is beneficial (0.6-6.0 ACH).${manualWindowSummaryText}`
     : nightPurgeEnabled
-      ? `${activeVentPreset.label} by day, night purge at ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour (22:00-06:00).`
-      : `${activeVentPreset.label} (${ventilationAchTotal.toFixed(1)} air changes per hour).`;
+      ? `${activeVentPreset.label} by day, night purge at ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour (22:00-06:00).${manualWindowSummaryText}`
+      : `${activeVentPreset.label} (${ventilationAchTotal.toFixed(1)} air changes per hour).${manualWindowSummaryText}`;
+  const ventilationComfortSummary = `Draught comfort check: ${ventilationComfort.label} (apparent cooling ~${ventilationComfort.apparentCoolingC.toFixed(1)}°C, feels like ~${ventilationComfort.perceivedTempC.toFixed(1)}°C).`;
+  const ventilationSummaryWithComfort = `${ventilationSummary} ${ventilationComfortSummary}`;
+  const ventilationWindAssumptionText = `Manual-opening airflow uses a fixed southwest wind of ${STANDARD_SW_WIND_MPH} mph.`;
 
   const snapshot = useMemo(() => {
     const indoorTempOverride = selectedPoint?.T_in;
+    // Heat recovery only applies when using mechanical ventilation without manual window openings
+    const effectiveHeatRecovery = hasManualOpenings ? 0 : ventilationHeatRecovery;
     return computeSnapshot({
       ...baseParams,
       dateMidday: dateAtTime,
       T_out: outdoorTemp,
       achTotal: achTotalAtTime,
+      heatRecoveryEfficiency: effectiveHeatRecovery,
       weatherRadiation:
         currentForcing.source === "epw"
           ? { DNI: currentForcing.DNI, DHI: currentForcing.DHI, GHI: currentForcing.GHI }
           : undefined,
       T_room_override: indoorTempOverride,
     });
-  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, currentForcing, selectedPoint?.T_in]);
+  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, ventilationHeatRecovery, hasManualOpenings, currentForcing, selectedPoint?.T_in]);
+  const downlightsOn = useMemo(() => {
+    const rawHour =
+      Number.isFinite(selectedHour) ? selectedHour : dateAtTime.getUTCHours();
+    const normalizedHour = ((Math.floor(rawHour) % 24) + 24) % 24;
+
+    // Calculate "on" hour based on sunrise (1 hour before)
+    let onHour = 6; // fallback if no sunrise
+    if (sunWindow.mode === "normal" && sunWindow.start) {
+      const sunriseHour = sunWindow.start.getHours() + sunWindow.start.getMinutes() / 60;
+      onHour = Math.max(0, sunriseHour - DOWNLIGHTS_PRE_SUNRISE_HOURS);
+    } else if (sunWindow.mode === "night") {
+      // Polar night - lights can be on all "day"
+      onHour = 0;
+    }
+
+    const isWithinSchedule =
+      normalizedHour >= onHour && normalizedHour < DOWNLIGHTS_OFF_HOUR;
+    return isWithinSchedule && (snapshot.illuminanceLux ?? 0) < LUX_THRESHOLDS.adequate;
+  }, [selectedHour, dateAtTime, snapshot.illuminanceLux, sunWindow]);
   const solarGainNow = Number.isFinite(selectedPoint?.Q_solar)
     ? selectedPoint.Q_solar
     : snapshot.Q_solar;
@@ -409,6 +974,10 @@ export default function App() {
         setTimeout(resolve, 0);
       });
     });
+  const waitForMs = (ms) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
 
   const renderCanvasToA4 = (sourceCanvas) => {
     const output = document.createElement("canvas");
@@ -448,6 +1017,15 @@ export default function App() {
     if (exportingPngs) return;
     const frontTarget = mainCaptureRef.current;
     if (!frontTarget) return;
+    const exportStartedAt =
+      typeof performance !== "undefined" && Number.isFinite(performance.now())
+        ? performance.now()
+        : Date.now();
+    trackAnalyticsEvent("export_png_started", {
+      ...buildAnalyticsContext(),
+      day_of_year: dayOfYear,
+      selected_hour: selectedHour,
+    });
     const infoPopoverNodes = Array.from(frontTarget.querySelectorAll("details[data-info-popover]"));
     const previouslyOpenInfoPopovers = infoPopoverNodes.filter((node) => node.open);
     infoPopoverNodes.forEach((node) => {
@@ -462,16 +1040,16 @@ export default function App() {
 
     const glazingSummary = [
       `Total window-to-wall ratio: ${Math.round(overallWWR * 100)}%`,
-      `North (${faceFacingLabel(FACES.find((f) => f.id === "north"))}): ${Math.round(faceState.north.glazing * 100)}%`,
-      `East (${faceFacingLabel(FACES.find((f) => f.id === "east"))}): ${Math.round(faceState.east.glazing * 100)}%`,
-      `South (${faceFacingLabel(FACES.find((f) => f.id === "south"))}): ${Math.round(faceState.south.glazing * 100)}%`,
-      `West (${faceFacingLabel(FACES.find((f) => f.id === "west"))}): ${Math.round(faceState.west.glazing * 100)}%`,
+      `North (${faceFacingLabel(FACES.find((f) => f.id === "north"))}): ${Math.round((faceWWR.north ?? 0) * 100)}%`,
+      `East (${faceFacingLabel(FACES.find((f) => f.id === "east"))}): ${Math.round((faceWWR.east ?? 0) * 100)}%`,
+      `South (${faceFacingLabel(FACES.find((f) => f.id === "south"))}): ${Math.round((faceWWR.south ?? 0) * 100)}%`,
+      `West (${faceFacingLabel(FACES.find((f) => f.id === "west"))}): ${Math.round((faceWWR.west ?? 0) * 100)}%`,
     ].join("\n");
     const shadingSummary = [
-      `North: overhang ${faceState.north.overhang.toFixed(2)}, vertical fins ${faceState.north.fin.toFixed(2)}, horizontal fins ${faceState.north.hFin.toFixed(2)}`,
-      `East: overhang ${faceState.east.overhang.toFixed(2)}, vertical fins ${faceState.east.fin.toFixed(2)}, horizontal fins ${faceState.east.hFin.toFixed(2)}`,
-      `South: overhang ${faceState.south.overhang.toFixed(2)}, vertical fins ${faceState.south.fin.toFixed(2)}, horizontal fins ${faceState.south.hFin.toFixed(2)}`,
-      `West: overhang ${faceState.west.overhang.toFixed(2)}, vertical fins ${faceState.west.fin.toFixed(2)}, horizontal fins ${faceState.west.hFin.toFixed(2)}`,
+      `North: overhang ${(faceState.north.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.north.fin.toFixed(2)}, horizontal fins ${faceState.north.hFin.toFixed(2)}`,
+      `East: overhang ${(faceState.east.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.east.fin.toFixed(2)}, horizontal fins ${faceState.east.hFin.toFixed(2)}`,
+      `South: overhang ${(faceState.south.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.south.fin.toFixed(2)}, horizontal fins ${faceState.south.hFin.toFixed(2)}`,
+      `West: overhang ${(faceState.west.overhang * 1000).toFixed(0)}mm, vertical fins ${faceState.west.fin.toFixed(2)}, horizontal fins ${faceState.west.hFin.toFixed(2)}`,
     ].join("\n");
     const fabricSummary = [
       `Preset: ${activeUPreset.label}`,
@@ -483,7 +1061,15 @@ export default function App() {
     const ventilationSummaryCompact = [
       `Preset: ${activeVentPreset.label}`,
       `${activeVentPreset.detail}`,
-      `Current rate: ${ventilationAchTotal.toFixed(1)} air changes per hour`,
+      `Current rate: ${achTotalAtTime.toFixed(1)} air changes per hour`,
+      hasManualOpenings
+        ? `Manual openings: total ${manualWindowVentilation.totalManualOpenAreaM2.toFixed(2)} m², ~${openedWindowAch.toFixed(1)} ACH (${manualWindowModeText})`
+        : `Manual openings: none open`,
+      `Windows: ${openedWindowArea.openLeafCount}/${openedWindowArea.totalLeafCount} sashes (${openedWindowArea.topHungLeafCount} top-hung = ${openedWindowArea.topHungAreaM2.toFixed(2)} m², ${openedWindowArea.turnLeafCount} turn = ${openedWindowArea.turnAreaM2.toFixed(2)} m²)`,
+      rooflightEnabled
+        ? `Rooflight: ON · ${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m, open ${Math.round(effectiveRooflightOpenHeight * 1000)} mm (${effectiveRooflightOpeningAreaM2.toFixed(2)} m² free area)`
+        : `Rooflight: OFF`,
+      `${ventilationComfort.label}: feels like ${ventilationComfort.perceivedTempC.toFixed(1)}°C (${ventilationComfort.apparentCoolingC.toFixed(1)}°C apparent cooling)`,
       `Adaptive mode: ${adaptiveVentEnabled ? "On" : "Off"}`,
       `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : nightPurgeEnabled ? "On" : "Off"}`,
     ].join("\n");
@@ -507,6 +1093,7 @@ export default function App() {
       // Let layout settle after opening "More details" and updating fixed chart size.
       await waitForNextFrame();
       await waitForNextFrame();
+      await waitForMs(PNG_EXPORT_RENDER_SETTLE_MS);
       const frontClone = frontTarget.cloneNode(true);
       frontExportHost = document.createElement("div");
       frontExportHost.style.position = "fixed";
@@ -674,9 +1261,26 @@ export default function App() {
         `room-comfort-frontpage-${dateStamp}-${exportStamp}.png`,
         frontA4Canvas,
       );
+      const exportDurationMs = Math.round(
+        (typeof performance !== "undefined" && Number.isFinite(performance.now())
+          ? performance.now()
+          : Date.now()) - exportStartedAt,
+      );
+      trackAnalyticsEvent("export_png_succeeded", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        duration_ms: Math.max(0, exportDurationMs),
+      });
     } catch (error) {
       console.error("[Export] PNG snapshots failed:", error);
       setExportError("PNG export failed. Please try again.");
+      trackAnalyticsEvent("export_png_failed", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+      });
     } finally {
       if (frontExportHost?.parentNode) {
         frontExportHost.parentNode.removeChild(frontExportHost);
@@ -701,12 +1305,25 @@ export default function App() {
       !HTMLCanvasElement.prototype.captureStream
     ) {
       setExportError("Video export is not supported in this browser. Try Chrome or Edge.");
+      trackAnalyticsEvent("export_video_unsupported", {
+        ...buildAnalyticsContext(),
+        reason: "mediarecorder_or_capturestream_unavailable",
+      });
       return;
     }
+    const exportStartedAt =
+      typeof performance !== "undefined" && Number.isFinite(performance.now())
+        ? performance.now()
+        : Date.now();
     setExportingVideo(true);
     setExportProgress(0);
     setExportError("");
     const previousTime = timeFrac;
+    trackAnalyticsEvent("export_video_started", {
+      ...buildAnalyticsContext(),
+      day_of_year: dayOfYear,
+      selected_hour: selectedHour,
+    });
 
     try {
       await waitForNextFrame();
@@ -823,9 +1440,27 @@ export default function App() {
         videoBlob,
         mimeType,
       );
+      const exportDurationMs = Math.round(
+        (typeof performance !== "undefined" && Number.isFinite(performance.now())
+          ? performance.now()
+          : Date.now()) - exportStartedAt,
+      );
+      trackAnalyticsEvent("export_video_succeeded", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        duration_ms: Math.max(0, exportDurationMs),
+        size_mb: Number((videoBlob.size / (1024 * 1024)).toFixed(2)),
+      });
     } catch (error) {
       console.error("[Export] Video failed:", error);
       setExportError("Video export failed. Try Chrome/Edge and keep the tab visible.");
+      trackAnalyticsEvent("export_video_failed", {
+        ...buildAnalyticsContext(),
+        day_of_year: dayOfYear,
+        selected_hour: selectedHour,
+        error_message: getAnalyticsErrorMessage(error).slice(0, 120),
+      });
     } finally {
       setTimeFrac(previousTime);
       setExportingVideo(false);
@@ -839,11 +1474,22 @@ export default function App() {
         comfortBand: COMFORT_BAND,
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
+        heatRecoveryEfficiency: ventilationHeatRecovery,
+        manualVentilationInput,
         nightPurgeEnabled,
         adaptiveVentEnabled,
         spinupHours: effectiveSpinupDays * 24,
       }),
-    [baseParams, weatherProvider, ventilationAchTotal, nightPurgeEnabled, adaptiveVentEnabled, effectiveSpinupDays],
+    [
+      baseParams,
+      weatherProvider,
+      ventilationAchTotal,
+      ventilationHeatRecovery,
+      manualVentilationInput,
+      nightPurgeEnabled,
+      adaptiveVentEnabled,
+      effectiveSpinupDays,
+    ],
   );
 
   const annualCostSummary = useMemo(() => {
@@ -887,6 +1533,14 @@ export default function App() {
     if (Math.abs(max - min) < 0.2) return [min - 1, max + 1];
     return [Math.floor((min - 1) * 2) / 2, Math.ceil((max + 1) * 2) / 2];
   }, [chartData]);
+  const ventChartDomainMax = useMemo(() => {
+    if (chartData.length === 0) return MAX_VENTILATION_ACH + 0.5;
+    const peakVent = chartData.reduce(
+      (acc, point) => Math.max(acc, Number.isFinite(point.ventAch) ? point.ventAch : 0),
+      MAX_VENTILATION_ACH,
+    );
+    return Math.max(MAX_VENTILATION_ACH + 0.5, Math.ceil((peakVent + 0.5) * 2) / 2);
+  }, [chartData]);
 
   const dayHourTicks = useMemo(
     () => Array.from({ length: 13 }, (_, idx) => idx * 2),
@@ -913,6 +1567,8 @@ export default function App() {
     { id: "evaluate", label: "evaluate (year)" },
   ];
 
+  const passivhausUPreset = U_VALUE_PRESETS[PASSIVHAUS_U_VALUE_PRESET];
+  const passivhausVentPreset = VENTILATION_PRESETS[PASSIVHAUS_VENTILATION_PRESET];
   const exploreTabs = [
     { id: "context", label: "Context" },
     { id: "general", label: "General settings" },
@@ -920,19 +1576,104 @@ export default function App() {
     { id: "shading", label: "Shading" },
     { id: "fabric", label: "Fabric (U values)" },
     { id: "ventilation", label: "Ventilation" },
+    { id: "passivhaus", label: "Passivhaus" },
     { id: "export", label: "Export" },
   ];
+  const handleViewModeChange = useCallback((nextViewMode) => {
+    if (viewMode === nextViewMode) return;
+    setViewMode(nextViewMode);
+    trackAnalyticsEvent("view_mode_changed", {
+      from_mode: viewMode,
+      to_mode: nextViewMode,
+    });
+  }, [trackAnalyticsEvent, viewMode]);
+  const handleExploreTabChange = useCallback((nextTabId) => {
+    if (exploreTab === nextTabId) return;
+    setExploreTab(nextTabId);
+    trackAnalyticsEvent("explore_tab_changed", {
+      from_tab: exploreTab,
+      to_tab: nextTabId,
+    });
+  }, [exploreTab, trackAnalyticsEvent]);
+  const handleWeatherModeChange = useCallback((nextWeatherMode) => {
+    if (weatherMode === nextWeatherMode) return;
+    setWeatherMode(nextWeatherMode);
+    trackAnalyticsEvent("weather_mode_selected", {
+      requested_mode: nextWeatherMode,
+      previous_mode: weatherMode,
+    });
+  }, [trackAnalyticsEvent, weatherMode]);
+  const handleUPresetChange = useCallback((presetId) => {
+    if (uValuePreset === presetId) return;
+    setUValuePreset(presetId);
+    trackAnalyticsEvent("u_value_preset_selected", {
+      from_preset: uValuePreset,
+      to_preset: presetId,
+    });
+  }, [trackAnalyticsEvent, uValuePreset]);
+  const handleVentilationPresetChange = useCallback((presetId) => {
+    if (ventilationPreset === presetId) return;
+    setVentilationPreset(presetId);
+    trackAnalyticsEvent("ventilation_preset_selected", {
+      from_preset: ventilationPreset,
+      to_preset: presetId,
+    });
+  }, [trackAnalyticsEvent, ventilationPreset]);
+  const handleNightPurgeChange = useCallback((enabled) => {
+    if (nightPurgeEnabled === enabled) return;
+    setNightPurgeEnabled(enabled);
+    trackAnalyticsEvent("night_purge_toggled", {
+      enabled: enabled ? "true" : "false",
+    });
+  }, [nightPurgeEnabled, trackAnalyticsEvent]);
+  const handleForceLowPerfModelChange = useCallback((enabled) => {
+    if (forceLowPerfModel === enabled) return;
+    setForceLowPerfModel(enabled);
+    trackAnalyticsEvent("low_power_mode_toggled", {
+      enabled: enabled ? "true" : "false",
+    });
+  }, [forceLowPerfModel, trackAnalyticsEvent]);
+  const handleAutoLowPerfModelChange = useCallback((enabled, source = "auto") => {
+    if (autoLowPerfModel === enabled) return;
+    setAutoLowPerfModel(enabled);
+    trackAnalyticsEvent("low_power_auto_fallback_changed", {
+      enabled: enabled ? "true" : "false",
+      source,
+    });
+  }, [autoLowPerfModel, trackAnalyticsEvent]);
+  const handleSeasonalMarkSelect = useCallback((mark) => {
+    setDayOfYear(mark.day);
+    trackAnalyticsEvent("seasonal_marker_selected", {
+      marker_label: mark.label,
+      day_of_year: mark.day,
+    });
+  }, [trackAnalyticsEvent]);
+  const handleCloseAllOpenings = useCallback(() => {
+    setOpenWindowSegments({});
+    setRooflightState((prev) => ({ ...prev, openHeight: 0 }));
+    setVentilationPreset("background");
+    trackAnalyticsEvent("manual_openings_reset", {
+      ...buildAnalyticsContext(),
+      previous_open_sashes: Object.keys(openWindowSegments).length,
+      previous_rooflight_open: rooflightState.openHeight > 0.001 ? "true" : "false",
+      resulting_ventilation_preset: "background",
+    });
+  }, [buildAnalyticsContext, openWindowSegments, rooflightState.openHeight, trackAnalyticsEvent]);
 
   return (
     <div className="relative min-h-screen bg-[#f5f3ee] lg:h-[100svh] lg:overflow-hidden">
       <div className="pointer-events-none absolute inset-0 opacity-[0.35] [background-image:linear-gradient(to_right,rgba(15,23,42,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(15,23,42,0.08)_1px,transparent_1px)] [background-size:24px_24px]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.65),transparent_55%)]" />
-      <main className="relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5">
+      <main
+        className={`relative z-10 mx-auto flex w-full max-w-none flex-col gap-4 px-4 pb-6 pt-6 lg:h-full lg:min-h-0 lg:px-8 lg:pb-5 lg:pt-5 ${exportingVideo || exportingPngs ? "pointer-events-none select-none" : ""}`}
+        aria-busy={exportingVideo || exportingPngs}
+        inert={exportingVideo || exportingPngs}
+      >
         <header className="flex flex-col gap-3 border-b border-slate-200/70 pb-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="space-y-1">
               <p className="text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-500">
-                Making Sustainable Architecture
+                Making Sustainable Architecture @ UWE Bristol
               </p>
               <h1 className="font-display text-2xl font-semibold text-slate-900 md:text-3xl">
                 Envelope, light, and comfort.
@@ -950,7 +1691,7 @@ export default function App() {
                         ? "border-b-2 border-slate-900 text-slate-900"
                         : "border-b-2 border-transparent text-slate-500 hover:border-slate-900 hover:text-slate-900"
                     }`}
-                    onClick={() => setViewMode(tab.id)}
+                    onClick={() => handleViewModeChange(tab.id)}
                   >
                     {tab.label}
                   </button>
@@ -959,8 +1700,9 @@ export default function App() {
             </div>
           </div>
           <p className="text-[11px] text-slate-600 md:text-xs md:leading-relaxed">
-            Tweak glazing, shading, and ventilation for a 4.8 m × 2.4 m room. See how solar gains and
-            heat losses evolve across the day and year.
+            Tweak glazing, shading, and ventilation for a {buildingWidth.toFixed(1)} m × {buildingDepth.toFixed(1)} m ×{" "}
+            {buildingHeight.toFixed(1)} m room (internal dimensions). See how solar gains and heat losses evolve
+            across the day and year.
           </p>
         </header>
 
@@ -982,21 +1724,40 @@ export default function App() {
                       cloudCover={cloudCover}
                       ventilationLabel={ventilationLabel}
                       ventilationAch={achTotalAtTime}
+                      buildingWidth={buildingWidth}
+                      buildingDepth={buildingDepth}
+                      buildingHeight={buildingHeight}
                       orientationDeg={orientationDeg}
                       captureMode={exportingVideo}
+                      openWindowSegments={openWindowSegments}
+                      onToggleWindowSegment={toggleWindowSegment}
+                      onResizeWindowGlazing={handlePreviewFaceGlazingResize}
+                      rooflightSpec={rooflightSpec}
+                      rooflightEnabled={rooflightEnabled}
+                      onToggleRooflight={toggleRooflightOpen}
+                      downlightsOn={downlightsOn}
+                      downlightIntensity={downlightIntensity}
+                      downlightAngle={downlightBeamAngle}
+                      downlightPenumbra={downlightPenumbra}
+                      downlightThrowScale={downlightThrowScale}
+                      downlightSourceGlow={downlightSourceGlow}
                       showMetrics={false}
                       size="compact"
                       stretch
                       className="flex-1"
+                      lowPerformanceMode={forceLowPerfModel}
+                      onAutoPerformanceFallback={(enabled) =>
+                        handleAutoLowPerfModelChange(enabled, "performance_monitor")
+                      }
                     />
                   </div>
 
                   <div className="flex h-full min-h-0 flex-col gap-1">
                     <Card
-                      className={`relative z-0 info-popover-host p-3 ${
-                        selectedPoint?.status === "heating"
+                      className={`relative z-0 info-popover-host flex flex-col items-center justify-center p-3 text-center lg:flex-1 ${
+                        comfortStatus === "heating"
                           ? "!bg-sky-100"
-                          : selectedPoint?.status === "cooling"
+                          : comfortStatus === "cooling"
                             ? "!bg-amber-100"
                             : "!bg-emerald-100"
                       }`}
@@ -1009,31 +1770,33 @@ export default function App() {
                         </p>
                       </InfoPopover>
                       <p
-                        className={`pr-8 text-xl font-semibold ${
-                          selectedPoint?.status === "heating"
+                        className={`text-xl font-semibold ${
+                          comfortStatus === "heating"
                             ? "text-sky-800"
-                            : selectedPoint?.status === "cooling"
+                            : comfortStatus === "cooling"
                               ? "text-amber-800"
                               : "text-emerald-800"
                         }`}
                       >
-                        {selectedPoint?.status === "heating"
-                          ? "Below comfort"
-                          : selectedPoint?.status === "cooling"
-                            ? "Above comfort"
-                            : "Within comfort"}
+                        {comfortStatusLabel}
                       </p>
+                      <div className="min-h-10 flex items-center justify-center">
+                        {showDraftWarning && (
+                          <p className="text-xs font-medium text-sky-700">
+                            Warning: Ventilation above 6 ACH may cause uncomfortable drafts.
+                          </p>
+                        )}
+                      </div>
                     </Card>
                     <div className="grid gap-1 sm:grid-cols-3 lg:grid-cols-1 lg:min-h-0">
                       <OutcomeCard
                         currentPoint={selectedPoint}
-                        comfortBand={COMFORT_BAND}
                         timeLabel={timeLabel}
                         dateLabel={selectedDateLabel}
                         outdoorTemp={outdoorTemp}
                         cloudCover={cloudCover}
                         compact
-                        className="h-full min-h-0 p-2 space-y-1"
+                        className="min-h-0 p-2 space-y-1"
                         info={
                           <>
                             <p>
@@ -1041,7 +1804,7 @@ export default function App() {
                               heating or cooling would be needed.
                             </p>
                             <p className="mt-1">
-                              Outdoor temperature reflects the selected hour. Measured weather shows cloud cover; simplified mode assumes clear sky.
+                              {outdoorTemperatureInfoText}
                             </p>
                           </>
                         }
@@ -1076,13 +1839,39 @@ export default function App() {
                           tight
                           className="min-h-0"
                           info={(() => {
-                            const volume = BUILDING_WIDTH * BUILDING_DEPTH * BUILDING_HEIGHT;
-                            const opening = calculateOpeningArea(achTotalAtTime, volume);
+                            const opening = calculateOpeningArea(achTotalAtTime, buildingVolume);
                             return (
                               <>
                                 <p>
                                   Fresh air rate is the total air changes per hour (ACH) from the chosen
-                                  preset, including background infiltration.
+                                  preset strategy, plus any clicked-open window sashes, including background infiltration.
+                                </p>
+                                {hasManualOpenWindows && (
+                                  <p className="mt-2 text-xs text-slate-600">
+                                    Clicked-open windows currently add{" "}
+                                    <strong>{openedWindowArea.totalOpenAreaM2.toFixed(2)} m²</strong> free opening
+                                    area ({openedWindowArea.topHungLeafCount} top-hung = {openedWindowArea.topHungAreaM2.toFixed(2)} m², {openedWindowArea.turnLeafCount} turn = {openedWindowArea.turnAreaM2.toFixed(2)} m²).
+                                  </p>
+                                )}
+                                <p className="mt-2 text-xs text-slate-600">
+                                  Rooflight free opening area is{" "}
+                                  <strong>{effectiveRooflightOpeningAreaM2.toFixed(2)} m²</strong>{" "}
+                                  {rooflightEnabled
+                                    ? `(${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m rooflight, open ${(effectiveRooflightOpenHeight * 1000).toFixed(0)} mm).`
+                                    : `(rooflight OFF).`}
+                                </p>
+                                {hasManualOpenings && (
+                                  <p className="mt-2 text-xs text-slate-600">
+                                    Total manual openings are equivalent to about{" "}
+                                    <strong>{openedWindowAch.toFixed(1)} ACH</strong> under a{" "}
+                                    <strong>{manualWindowModeText}</strong> assumption.
+                                  </p>
+                                )}
+                                <p className="mt-2 text-xs text-slate-600">
+                                  <strong>Draught-adjusted feel:</strong> {perceivedComfortLabel} at{" "}
+                                  <strong>{ventilationComfort.perceivedTempC.toFixed(1)}°C</strong>. This estimates
+                                  how moving air changes perceived temperature; apparent cooling is about{" "}
+                                  <strong>{ventilationComfort.apparentCoolingC.toFixed(1)}°C</strong> at this time.
                                 </p>
                                 {achTotalAtTime <= 0.3 ? (
                                   <p className="mt-2 text-xs text-slate-600">
@@ -1181,7 +1970,7 @@ export default function App() {
                             />
                             <YAxis domain={chartDomain} allowDecimals label={{ value: "Temperature (°C)", angle: -90, position: "insideLeft", fontSize: 11, fill: "#64748b" }} />
                             <YAxis yAxisId="solar" orientation="right" tickFormatter={(v) => `${Math.round(v)}`} label={{ value: "Solar Gain (W)", angle: 90, position: "insideRight", fontSize: 11, fill: "#64748b" }} />
-                            <YAxis yAxisId="vent" hide domain={[0, MAX_VENTILATION_ACH + 0.5]} />
+                            <YAxis yAxisId="vent" hide domain={[0, ventChartDomainMax]} />
                             <YAxis yAxisId="heatLoss" hide domain={[0, 'auto']} />
                             <Tooltip
                               wrapperStyle={{ zIndex: 50 }}
@@ -1209,6 +1998,7 @@ export default function App() {
                             <Line
                               dataKey="roomTemperature"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#0f766e"
                               name="Room temperature"
@@ -1216,6 +2006,7 @@ export default function App() {
                             <Line
                               dataKey="outdoorTemperature"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               strokeDasharray="6 4"
                               stroke="#2563eb"
@@ -1225,6 +2016,7 @@ export default function App() {
                               yAxisId="solar"
                               dataKey="solarGain"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#f59e0b"
                               name="Solar gains"
@@ -1233,6 +2025,7 @@ export default function App() {
                               yAxisId="vent"
                               dataKey="ventAch"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               strokeDasharray="3 3"
                               stroke="#7c3aed"
@@ -1242,6 +2035,7 @@ export default function App() {
                               yAxisId="heatLoss"
                               dataKey="heatLoss"
                               dot={false}
+                              isAnimationActive={!exportingPngs}
                               strokeWidth={2}
                               stroke="#e11d48"
                               name="Heat loss"
@@ -1266,7 +2060,7 @@ export default function App() {
                     More details
                   </summary>
                   <div className="mt-4 space-y-4">
-                    <div className="grid gap-3 md:grid-cols-4">
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                       {FACES.map((face) => (
                         <Metric
                           key={face.id}
@@ -1275,6 +2069,12 @@ export default function App() {
                           accent={face.accent}
                         />
                       ))}
+                      <Metric
+                        key="rooflight-solar-gain"
+                        label="Rooflight solar gain"
+                        value={`${Math.round(snapshot.Q_solar_rooflight ?? 0)} W`}
+                        accent="#f59e0b"
+                      />
                     </div>
                     <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
                       <Metric
@@ -1286,7 +2086,7 @@ export default function App() {
                       <Metric
                         label="Heat through surfaces"
                         value={`${Math.round(snapshot.Q_loss_fabric)} W`}
-                        helper={`Walls ${Math.round(snapshot.Q_loss_walls)} · Windows ${Math.round(snapshot.Q_loss_windows)} · Roof ${Math.round(snapshot.Q_loss_roof)} · Floor ${Math.round(snapshot.Q_loss_floor)} W at the selected hour`}
+                        helper={`Walls ${Math.round(snapshot.Q_loss_walls)} · Windows ${Math.round(snapshot.Q_loss_windows)} · Rooflight ${Math.round(snapshot.Q_loss_rooflight ?? 0)} · Roof ${Math.round(snapshot.Q_loss_roof)} · Floor ${Math.round(snapshot.Q_loss_floor)} W at the selected hour`}
                         accent="#be123c"
                       />
                       <Metric
@@ -1299,7 +2099,12 @@ export default function App() {
                     <InsightsCard
                       snapshot={snapshot}
                       faceConfigs={faceState}
-                      ventilationSummary={ventilationSummary}
+                      ventilationSummary={ventilationSummaryWithComfort}
+                      dimensions={{
+                        width: buildingWidth,
+                        depth: buildingDepth,
+                        height: buildingHeight,
+                      }}
                     />
                   </div>
                 </details>
@@ -1316,14 +2121,38 @@ export default function App() {
                   cloudCover={cloudCover}
                   ventilationLabel={ventilationLabel}
                   ventilationAch={achTotalAtTime}
+                  buildingWidth={buildingWidth}
+                  buildingDepth={buildingDepth}
+                  buildingHeight={buildingHeight}
                   orientationDeg={orientationDeg}
                   captureMode={exportingVideo}
+                  openWindowSegments={openWindowSegments}
+                  onToggleWindowSegment={toggleWindowSegment}
+                  onResizeWindowGlazing={handlePreviewFaceGlazingResize}
+                  rooflightSpec={rooflightSpec}
+                  rooflightEnabled={rooflightEnabled}
+                  onToggleRooflight={toggleRooflightOpen}
+                  downlightsOn={downlightsOn}
+                  downlightIntensity={downlightIntensity}
+                  downlightAngle={downlightBeamAngle}
+                  downlightPenumbra={downlightPenumbra}
+                  downlightThrowScale={downlightThrowScale}
+                  downlightSourceGlow={downlightSourceGlow}
+                  lowPerformanceMode={forceLowPerfModel}
+                  onAutoPerformanceFallback={(enabled) =>
+                    handleAutoLowPerfModelChange(enabled, "performance_monitor")
+                  }
                 />
 
                 <InsightsCard
                   snapshot={snapshot}
                   faceConfigs={faceState}
-                  ventilationSummary={ventilationSummary}
+                  ventilationSummary={ventilationSummaryWithComfort}
+                  dimensions={{
+                    width: buildingWidth,
+                    depth: buildingDepth,
+                    height: buildingHeight,
+                  }}
                 />
 
                 <ComfortGuidanceCard
@@ -1560,7 +2389,7 @@ export default function App() {
                           <button
                             key={mark.label}
                             type="button"
-                            onClick={() => setDayOfYear(mark.day)}
+                            onClick={() => handleSeasonalMarkSelect(mark)}
                             className="text-[10px] text-slate-500 hover:text-slate-900 hover:underline"
                           >
                             {mark.label}
@@ -1591,25 +2420,25 @@ export default function App() {
                   </Card>
                   <Card className="space-y-3 p-4">
                     <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Settings</p>
-                  <div className="flex flex-wrap gap-2">
-                    {exploreTabs.map((tab) => {
-                      const isActive = exploreTab === tab.id;
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${
-                            isActive
-                              ? "border-slate-900 bg-slate-900 text-white"
-                              : "border-slate-200 text-slate-500 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
-                          }`}
-                          onClick={() => setExploreTab(tab.id)}
-                        >
-                          {tab.label}
-                        </button>
-                      );
-                    })}
-                  </div>
+                    <div className="flex flex-wrap gap-2">
+                      {exploreTabs.map((tab) => {
+                        const isActive = exploreTab === tab.id;
+                        return (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+                              isActive
+                                ? "border-slate-900 bg-slate-900 text-white"
+                                : "border-slate-200 text-slate-500 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
+                            }`}
+                            onClick={() => handleExploreTabChange(tab.id)}
+                          >
+                            {tab.label}
+                          </button>
+                        );
+                      })}
+                    </div>
 
                   <div className="rounded-lg border border-slate-200 bg-white p-3">
                     {exploreTab === "context" && (
@@ -1617,16 +2446,49 @@ export default function App() {
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-xs font-medium text-slate-600">Weather source</p>
                           <div className="flex flex-col gap-2">
-                            <Button size="sm" variant="default" className="w-full justify-start" disabled>
-                              Simplified (Pencilli - Brecon)
+                            <Button
+                              size="sm"
+                              variant={weatherMode === "synthetic" ? "default" : "secondary"}
+                              className="w-full justify-start"
+                              onClick={() => handleWeatherModeChange("synthetic")}
+                            >
+                              Simplified synthetic (default)
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant={weatherMode === "epw" ? "default" : "secondary"}
+                              className="w-full justify-start"
+                              onClick={() => handleWeatherModeChange("epw")}
+                              disabled={!epwAvailable && !epwLoading}
+                            >
+                              {epwLoading
+                                ? "EPW measured weather (loading...)"
+                                : epwAvailable
+                                  ? "EPW measured weather"
+                                  : "EPW measured weather (unavailable)"}
                             </Button>
                           </div>
                           <p className="text-xs text-slate-600">{weatherDescription}</p>
-                          <p className="text-xs text-slate-500">
-                            Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
-                            swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
-                            useful for highlighting likely overheating and underheating periods.
-                          </p>
+                          {effectiveWeatherMode === "synthetic" ? (
+                            <p className="text-xs text-slate-500">
+                              Compromise: this is not measured hourly weather, so cloud, wind, humidity and short-term
+                              swings are simplified. Daytime peaks can run hotter than real conditions, but it is still
+                              useful for highlighting likely overheating and underheating periods.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-slate-500">
+                              EPW mode uses measured/typical-hourly weather (TMYx) for this location, so solar and
+                              outdoor temperature reflect cloud and seasonal conditions in the file.
+                            </p>
+                          )}
+                          {weatherMode === "epw" && effectiveWeatherMode !== "epw" && (
+                            <p className="text-xs text-amber-700">
+                              EPW is unavailable right now, so the model is running in synthetic mode.
+                            </p>
+                          )}
+                          {epwLoadError && (
+                            <p className="text-xs text-amber-700">{epwLoadError}</p>
+                          )}
                           <p className="text-xs text-slate-500">
                             {Math.abs(weatherMeta.latitude).toFixed(3)}°{weatherMeta.latitude >= 0 ? "N" : "S"},{" "}
                             {Math.abs(weatherMeta.longitude).toFixed(3)}°{weatherMeta.longitude >= 0 ? "E" : "W"} ·
@@ -1661,6 +2523,73 @@ export default function App() {
 
                     {exploreTab === "general" && (
                       <div className="space-y-2">
+                        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-sm font-medium text-slate-800">Room dimensions (internal)</p>
+                          <SliderField
+                            label="Width"
+                            value={buildingWidth}
+                            onChange={setBuildingWidth}
+                            min={2}
+                            max={5}
+                            step={0.1}
+                            formatValue={(v) => `${v.toFixed(1)} m`}
+                          />
+                          <SliderField
+                            label="Depth"
+                            value={buildingDepth}
+                            onChange={setBuildingDepth}
+                            min={2}
+                            max={5}
+                            step={0.1}
+                            formatValue={(v) => `${v.toFixed(1)} m`}
+                          />
+                          <SliderField
+                            label="Floor-to-ceiling height"
+                            value={buildingHeight}
+                            onChange={setBuildingHeight}
+                            min={2.1}
+                            max={3.5}
+                            step={0.1}
+                            formatValue={(v) => `${v.toFixed(1)} m`}
+                          />
+                          <div className="rounded-md bg-slate-50 p-2 text-xs text-slate-600">
+                            Floor area {buildingFloorArea.toFixed(2)} m² · Volume {buildingVolume.toFixed(2)} m³
+                          </div>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-slate-800">3D model low-power mode</p>
+                              <p className="text-xs text-slate-500">
+                                Reduces model frame rate and visual effects to help slower computers.
+                              </p>
+                            </div>
+                            <Switch
+                              checked={forceLowPerfModel}
+                              onCheckedChange={handleForceLowPerfModelChange}
+                            />
+                          </div>
+                          {!forceLowPerfModel && autoLowPerfModel && (
+                            <div className="space-y-2">
+                              <p className="text-xs text-amber-700">
+                                Auto fallback is active because low frame rate was detected.
+                              </p>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => handleAutoLowPerfModelChange(false, "manual_reset")}
+                              >
+                                Return to standard quality
+                              </Button>
+                            </div>
+                          )}
+                          <p className="text-xs text-slate-500">
+                            Current mode:{" "}
+                            <span className="font-semibold text-slate-700">
+                              {lowPerfModelActive ? "Low power (~12 FPS)" : "Standard quality"}
+                            </span>
+                          </p>
+                        </div>
                         <div className="rounded-lg border border-slate-200 bg-white p-3">
                           <p className="text-sm font-medium text-slate-800">Warm-up period</p>
                           <p className="mt-1 text-xs text-slate-500">
@@ -1680,7 +2609,7 @@ export default function App() {
                       <div className="space-y-2">
                         <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
                           <SliderField
-                            label="Total window-to-wall ratio"
+                            label="Total window width ratio"
                             value={overallWWR}
                             onChange={setOverallGlazing}
                             min={0}
@@ -1689,29 +2618,143 @@ export default function App() {
                             formatValue={(v) => `${Math.round(v * 100)}%`}
                           />
                           <p className="text-xs text-slate-500">
-                            Adjusting this resets per-face glazing to an even split.
+                            Adjusting this resets per-face width ratios to an even split.
                           </p>
+                          <p className="text-xs text-slate-500">
+                            Effective total WWR (area-based): {Math.round(overallWWR * 100)}%.
+                          </p>
+                          <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50/60 p-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-xs font-semibold text-slate-700">
+                                Flat rooflight (inside parapet)
+                              </p>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] text-slate-600">On/off</span>
+                                <Switch
+                                  checked={rooflightEnabled}
+                                  onCheckedChange={handleRooflightEnabledChange}
+                                />
+                              </div>
+                            </div>
+                            <p className="text-[11px] text-slate-600">
+                              Starts at 1.00 × 1.00 m and can only expand. Maximum size keeps at least{" "}
+                              {(ROOFLIGHT_MAX_EDGE_OFFSET_M * 1000).toFixed(0)} mm clearance to the inside parapet.
+                              {rooflightEnabled
+                                ? ` Click the rooflight in the model to open it by ${(WINDOW_OPEN_TRAVEL_M * 1000).toFixed(0)} mm.`
+                                : " Rooflight is currently off."}
+                            </p>
+                            <SliderField
+                              label="Rooflight width"
+                              value={rooflightState.width}
+                              onChange={(v) => handleRooflightSizeChange("width", v)}
+                              min={rooflightSizeLimits.minSize}
+                              max={rooflightSizeLimits.maxWidth}
+                              step={0.01}
+                              disabled={!rooflightEnabled}
+                              formatValue={(v) => `${v.toFixed(2)} m`}
+                            />
+                            <SliderField
+                              label="Rooflight depth"
+                              value={rooflightState.depth}
+                              onChange={(v) => handleRooflightSizeChange("depth", v)}
+                              min={rooflightSizeLimits.minSize}
+                              max={rooflightSizeLimits.maxDepth}
+                              step={0.01}
+                              disabled={!rooflightEnabled}
+                              formatValue={(v) => `${v.toFixed(2)} m`}
+                            />
+                            <div className="rounded-md bg-slate-100 p-2 text-xs text-slate-600">
+                              {rooflightEnabled
+                                ? `Current rooflight ${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m · opening ${Math.round(effectiveRooflightOpenHeight * 1000)} mm (${effectiveRooflightOpeningAreaM2.toFixed(2)} m² free area)`
+                                : `Rooflight is off (no opening area, no rooflight solar/heat transfer contribution).`}
+                            </div>
+                          </div>
                           <div className="space-y-3">
-                            {FACES.map((face) => (
-                              <SliderField
-                                key={face.id}
-                                label={
-                                  <span>
-                                    {face.label} glazing{" "}
+                            {FACES.map((face) => {
+                              const config = faceState[face.id];
+                              const faceSpan =
+                                face.id === "east" || face.id === "west"
+                                  ? buildingDepth
+                                  : buildingWidth;
+                              const glazingRatio = Math.max(
+                                0,
+                                Math.min(0.8, config?.glazing ?? 0),
+                              );
+                              const maxCenterRatio = Math.max(0, 1 - glazingRatio);
+                              const centerRatio = clampWindowCenterRatio(
+                                glazingRatio,
+                                config?.windowCenterRatio ?? 0,
+                              );
+                              const cillLift = config?.cillLift ?? 0;
+                              const headDrop = config?.headDrop ?? 0;
+                              const maxTotal = Math.max(
+                                0,
+                                buildingHeight - MIN_WINDOW_CLEAR_HEIGHT
+                              );
+                              const maxCillLift = Math.max(0, maxTotal - headDrop);
+                              const maxHeadDrop = Math.max(0, maxTotal - cillLift);
+
+                              return (
+                                <div
+                                  key={face.id}
+                                  className="space-y-2 rounded-lg border border-slate-200 bg-slate-50/60 p-2"
+                                >
+                                  <p className="text-xs font-semibold text-slate-700">
+                                    {face.label} window geometry{" "}
                                     <span className="text-[10px] font-normal text-slate-400">
                                       (Facing {faceFacingLabel(face)})
                                     </span>
-                                  </span>
-                                }
-                                value={faceState[face.id].glazing}
-                                onChange={(v) => updateFace(face.id, "glazing", v)}
-                                min={0}
-                                max={0.8}
-                                step={0.05}
-                                formatValue={(v) => `${Math.round(v * 100)}%`}
-                              />
-                            ))}
+                                  </p>
+                                  <p className="text-[11px] text-slate-600">
+                                    Effective {face.label} WWR:{" "}
+                                    <span className="font-semibold text-slate-800">
+                                      {Math.round((faceWWR[face.id] ?? 0) * 100)}%
+                                    </span>
+                                  </p>
+                                  <SliderField
+                                    label={`${face.label} glazing width ratio`}
+                                    value={config.glazing}
+                                    onChange={(v) => updateFace(face.id, "glazing", v)}
+                                    min={0}
+                                    max={0.8}
+                                    step={0.05}
+                                    formatValue={(v) => `${Math.round(v * 100)}%`}
+                                  />
+                                  <SliderField
+                                    label="Horizontal offset"
+                                    value={centerRatio}
+                                    onChange={(v) => updateFace(face.id, "windowCenterRatio", v)}
+                                    min={-maxCenterRatio}
+                                    max={maxCenterRatio}
+                                    step={0.01}
+                                    formatValue={(v) => `${((v * faceSpan) / 2).toFixed(2)} m`}
+                                  />
+                                  <SliderField
+                                    label="Cill lift"
+                                    value={cillLift}
+                                    onChange={(v) => handleFaceCillLiftChange(face.id, v)}
+                                    min={0}
+                                    max={maxCillLift}
+                                    step={0.01}
+                                    formatValue={(v) => `${v.toFixed(2)} m`}
+                                  />
+                                  <SliderField
+                                    label="Head drop"
+                                    value={headDrop}
+                                    onChange={(v) => handleFaceHeadDropChange(face.id, v)}
+                                    min={0}
+                                    max={maxHeadDrop}
+                                    step={0.01}
+                                    formatValue={(v) => `${v.toFixed(2)} m`}
+                                  />
+                                </div>
+                              );
+                            })}
                           </div>
+                          <p className="text-xs text-slate-500">
+                            Cill/head controls are per facade. Minimum clear opening kept at{" "}
+                            {MIN_WINDOW_CLEAR_HEIGHT.toFixed(2)} m.
+                          </p>
                         </div>
                       </div>
                     )}
@@ -1732,13 +2775,13 @@ export default function App() {
                                 </p>
                               </div>
                               <SliderField
-                                label="Overhang ratio (d/h)"
+                                label="Overhang depth"
                                 value={config.overhang}
                                 onChange={(v) => updateFace(face.id, "overhang", v)}
                                 min={0}
-                                max={0.5}
-                                step={0.05}
-                                formatValue={(v) => v.toFixed(2)}
+                                max={1.5}
+                                step={0.1}
+                                formatValue={(v) => `${(v * 1000).toFixed(0)} mm`}
                               />
                               <SliderField
                                 label="Vertical fins"
@@ -1782,7 +2825,7 @@ export default function App() {
                                   size="sm"
                                   variant={uValuePreset === presetId ? "default" : "secondary"}
                                   className="w-full justify-start"
-                                  onClick={() => setUValuePreset(presetId)}
+                                  onClick={() => handleUPresetChange(presetId)}
                                 >
                                   {preset.label}
                                 </Button>
@@ -1812,7 +2855,7 @@ export default function App() {
                                     size="sm"
                                     variant={ventilationPreset === presetId ? "default" : "secondary"}
                                     className="flex-1 justify-start"
-                                    onClick={() => setVentilationPreset(presetId)}
+                                    onClick={() => handleVentilationPresetChange(presetId)}
                                   >
                                     {preset.label}
                                   </Button>
@@ -1823,10 +2866,27 @@ export default function App() {
                           <p className="text-xs text-slate-500">{activeVentPreset.detail}</p>
                           {!adaptiveVentEnabled && (
                             <p className="text-xs text-slate-500">
-                              Current rate: {ventilationAchTotal.toFixed(1)} air changes per hour (includes{" "}
-                              {ACH_INFILTRATION_DEFAULT.toFixed(1)} background).
+                              Current rate: {achTotalAtTime.toFixed(1)} air changes per hour (includes{" "}
+                              {ACH_INFILTRATION_DEFAULT.toFixed(1)} background
+                              {hasManualOpenings ? ` + ${openedWindowAch.toFixed(1)} from manual openings` : ""}).
                             </p>
                           )}
+                          <p className="text-xs text-slate-500">
+                            {ventilationComfortSummary}
+                          </p>
+                          <p className="text-xs text-slate-500">{ventilationWindAssumptionText}</p>
+                          {hasManualOpenWindows && (
+                            <p className="text-xs text-slate-500">
+                              Clicked windows open area: {openedWindowArea.totalOpenAreaM2.toFixed(2)} m² across{" "}
+                              {openedWindowArea.openLeafCount} sash
+                              {openedWindowArea.openLeafCount === 1 ? "" : "es"} ({openedWindowArea.topHungLeafCount} top-hung = {openedWindowArea.topHungAreaM2.toFixed(2)} m², {openedWindowArea.turnLeafCount} turn = {openedWindowArea.turnAreaM2.toFixed(2)} m²; {manualWindowModeText}).
+                            </p>
+                          )}
+                          <p className="text-xs text-slate-500">
+                            {rooflightEnabled
+                              ? `Rooflight: ${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m, open ${Math.round(effectiveRooflightOpenHeight * 1000)} mm (${effectiveRooflightOpeningAreaM2.toFixed(2)} m² free area).`
+                              : "Rooflight: OFF."}
+                          </p>
                         </div>
                         <div className={`flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3 ${adaptiveVentEnabled ? "opacity-50" : ""}`}>
                           <div>
@@ -1839,9 +2899,76 @@ export default function App() {
                           </div>
                           <Switch
                             checked={adaptiveVentEnabled || nightPurgeEnabled}
-                            onCheckedChange={setNightPurgeEnabled}
+                            onCheckedChange={handleNightPurgeChange}
                             disabled={adaptiveVentEnabled}
                           />
+                        </div>
+                        <div className="rounded-lg border border-slate-200 bg-white p-3">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="w-full"
+                            onClick={handleCloseAllOpenings}
+                          >
+                            Close all windows
+                          </Button>
+                          <p className="mt-2 text-xs text-slate-500">
+                            Closes all manually opened windows and rooflight, resets to background trickle ventilation.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {exploreTab === "passivhaus" && (
+                      <div className="space-y-2">
+                        <div className="space-y-2 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
+                          <p className="text-sm font-medium text-slate-800">Passivhaus override (indicative)</p>
+                          <p className="text-xs text-slate-600">
+                            Applies a one-click, Passivhaus-style starting point for quick design comparison.
+                          </p>
+                          <Button
+                            size="sm"
+                            className="w-full justify-start"
+                            onClick={applyPassivhausOverride}
+                          >
+                            Apply Passivhaus settings
+                          </Button>
+                          <p className="text-xs text-slate-500">
+                            Orientation is not changed. You keep control of site orientation because solar gains are
+                            orientation-dependent.
+                          </p>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-xs font-medium text-slate-600">What this changes</p>
+                          <ul className="list-disc space-y-1 pl-4 text-xs text-slate-500">
+                            <li>
+                              Fabric preset to{" "}
+                              <span className="font-medium text-slate-700">{passivhausUPreset?.label ?? "Passivhaus"}</span>{" "}
+                              (walls {passivhausUPreset?.values?.wall?.toFixed?.(2) ?? "n/a"}, roof{" "}
+                              {passivhausUPreset?.values?.roof?.toFixed?.(2) ?? "n/a"}, floor{" "}
+                              {passivhausUPreset?.values?.floor?.toFixed?.(2) ?? "n/a"}, windows{" "}
+                              {passivhausUPreset?.values?.window?.toFixed?.(2) ?? "n/a"} W/m²K).
+                            </li>
+                            <li>
+                              Ventilation preset to{" "}
+                              <span className="font-medium text-slate-700">{passivhausVentPreset?.label ?? "MVHR"}</span>{" "}
+                              at {passivhausVentPreset?.achTotal?.toFixed?.(1) ?? "n/a"} ACH.
+                            </li>
+                            <li>Night purge on (adds overnight cooling support from 22:00-06:00).</li>
+                            <li>
+                              Facade defaults: smaller N/E/W glazing, larger south glazing, plus south overhang and
+                              E/W fins to temper summer solar gains.
+                            </li>
+                            <li>Closes all manual window openings and disables rooflight.</li>
+                          </ul>
+                        </div>
+                        <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                          <p className="text-xs font-medium text-slate-600">Why these settings</p>
+                          <p className="text-xs text-slate-500">
+                            Passivhaus-style design typically prioritizes very low heat loss, controlled ventilation,
+                            and solar-aware glazing/shading. This preset is intentionally educational and indicative,
+                            not a certification check.
+                          </p>
                         </div>
                       </div>
                     )}
@@ -1920,6 +3047,24 @@ export default function App() {
         </div>
 
       </main>
+      {exportingVideo && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/45 backdrop-blur-[2px]">
+          <div className="flex min-w-[260px] flex-col items-center gap-4 rounded-2xl border border-slate-300/70 bg-[#f5f3ee] px-8 py-7 shadow-2xl">
+            <div className="h-20 w-20 animate-spin rounded-full border-[7px] border-slate-300 border-t-slate-800" />
+            <p className="text-sm font-semibold tracking-wide text-slate-800">Recording video...</p>
+            <p className="text-xs text-slate-600">Progress: {Math.round(exportProgress * 100)}%</p>
+          </div>
+        </div>
+      )}
+      {exportingPngs && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/45 backdrop-blur-[2px]">
+          <div className="flex min-w-[280px] flex-col items-center gap-4 rounded-2xl border border-slate-300/70 bg-[#f5f3ee] px-8 py-8 shadow-2xl">
+            <div className="h-24 w-24 animate-spin rounded-full border-[8px] border-slate-300 border-t-slate-800" />
+            <p className="text-base font-semibold tracking-wide text-slate-800">Exporting PNG snapshot...</p>
+            <p className="text-xs text-slate-600">Preparing chart and rendering page</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
