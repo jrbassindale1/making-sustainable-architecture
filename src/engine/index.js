@@ -62,7 +62,7 @@ export const U_VALUE_PRESETS = {
       wall: 0.1,
       roof: 0.1,
       floor: 0.1,
-      window: 0.8,
+      window: 0.7,
     },
   },
 };
@@ -820,14 +820,43 @@ export function ventilationStateForStep({
   achTotal = ACH_INFILTRATION_DEFAULT,
   hourOfDay = 12,
   nightPurgeEnabled = false,
+  indoorTemp,
+  outdoorTemp,
+  comfortBand = COMFORT_BAND,
+  nightPurgeFloorTemp = COMFORT_BAND.min,
+  minBenefitDelta = 1,
 }) {
   const purgeTotal = VENTILATION_PRESETS.purge?.achTotal ?? achTotal;
-  const targetTotal =
-    nightPurgeEnabled && isNightHour(hourOfDay) ? Math.max(achTotal, purgeTotal) : achTotal;
+  const isNightPurgeWindow = nightPurgeEnabled && isNightHour(hourOfDay);
+  const hasTempInputs = Number.isFinite(indoorTemp) && Number.isFinite(outdoorTemp);
+  const coolingBenefit = hasTempInputs ? indoorTemp - outdoorTemp : 0;
+  const isOverheating = hasTempInputs ? indoorTemp > comfortBand.max : false;
+  const aboveFloor = hasTempInputs ? indoorTemp > nightPurgeFloorTemp : false;
+  const purgeActive =
+    isNightPurgeWindow &&
+    hasTempInputs &&
+    isOverheating &&
+    aboveFloor &&
+    coolingBenefit >= minBenefitDelta;
+  const targetTotal = purgeActive ? Math.max(achTotal, purgeTotal) : achTotal;
   const safeTotal = Math.max(ACH_INFILTRATION_DEFAULT, targetTotal);
   const achWindow = Math.max(0, safeTotal - ACH_INFILTRATION_DEFAULT);
   const ventActive = achWindow > 0;
-  return { ventActive, achWindow, achTotal: safeTotal };
+  let nightPurgeReason = "disabled";
+  if (isNightPurgeWindow) {
+    if (!hasTempInputs) nightPurgeReason = "missing-temp";
+    else if (!isOverheating) nightPurgeReason = "comfortable";
+    else if (!aboveFloor) nightPurgeReason = "night-floor";
+    else if (coolingBenefit < minBenefitDelta) nightPurgeReason = "outdoor-warm";
+    else nightPurgeReason = "night-cooling";
+  }
+  return {
+    ventActive,
+    achWindow,
+    achTotal: safeTotal,
+    nightPurgeActive: purgeActive,
+    nightPurgeReason,
+  };
 }
 
 export function adaptiveVentilationStateForStep({
@@ -1652,6 +1681,9 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
           achTotal: achTotalPreset,
           hourOfDay,
           nightPurgeEnabled,
+          indoorTemp,
+          outdoorTemp: forcing.T_out,
+          comfortBand,
         });
     const manualVent = manualVentilationInput
       ? calculateManualWindowVentilation(
@@ -1689,7 +1721,7 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
 
     // Heat recovery only applies to mechanical ventilation, not window-based ventilation
     // Disable HR when: adaptive mode, manual windows open, or night purge active
-    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const isNightPurgeActive = baseVent.nightPurgeActive === true;
     const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
     const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
 
@@ -1754,6 +1786,8 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       manualOpenAch: step.vent.manualOpenAch,
       manualVentilationMode: step.vent.manualVentilation?.mode,
       adaptiveReason: step.vent.adaptiveReason,
+      nightPurgeActive: step.vent.nightPurgeActive === true,
+      nightPurgeReason: step.vent.nightPurgeReason,
       illuminanceLux: step.snapshot.illuminanceLux,
     });
 
@@ -1793,6 +1827,9 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
           achTotal: achTotalPreset,
           hourOfDay: time.getUTCHours(),
           nightPurgeEnabled,
+          indoorTemp,
+          outdoorTemp: forcing.T_out,
+          comfortBand,
         });
     const manualVent = manualVentilationInput
       ? calculateManualWindowVentilation(
@@ -1823,8 +1860,7 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
     };
 
     // Heat recovery only applies to mechanical ventilation, not window-based ventilation
-    const hourOfDay = time.getUTCHours();
-    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const isNightPurgeActive = baseVent.nightPurgeActive === true;
     const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
     const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
 

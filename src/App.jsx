@@ -68,7 +68,6 @@ import {
   formatClockTime,
   formatHourRange,
   formatMonthDayTime,
-  isNightHour,
   normalizedAzimuth,
   nextWindowSegmentState,
   normalizeWindowSegmentState,
@@ -505,7 +504,7 @@ export default function App() {
   const applyPassivhausOverride = useCallback(() => {
     setUValuePreset(PASSIVHAUS_U_VALUE_PRESET);
     setVentilationPreset(PASSIVHAUS_VENTILATION_PRESET);
-    setNightPurgeEnabled(true);
+    setNightPurgeEnabled(false);
     setFaceState({
       north: { ...PASSIVHAUS_FACE_STATE.north },
       east: { ...PASSIVHAUS_FACE_STATE.east },
@@ -772,7 +771,7 @@ export default function App() {
     selectedPoint?.time?.getUTCHours?.() ??
     Math.floor((Number.isFinite(timeFrac) ? timeFrac : MIDDAY_TIME_FRAC) * 24);
   const selectedHourRangeLabel = formatHourRange(selectedHour);
-  const isNightTime = isNightHour(dateAtTime.getUTCHours());
+  const nightPurgeActiveAtTime = selectedPoint?.nightPurgeActive === true;
   const currentForcing = useMemo(
     () => forcingAt(dateAtTime, weatherProvider),
     [dateAtTime, weatherProvider],
@@ -865,16 +864,16 @@ export default function App() {
           : adaptiveReason === "outdoor-warm"
             ? "Adaptive (outdoor warm)"
             : "Adaptive (comfortable)"
-    : nightPurgeEnabled && isNightTime
+    : nightPurgeEnabled && nightPurgeActiveAtTime
       ? "Night purge"
-      : activeVentPreset.label;
+    : activeVentPreset.label;
   const ventilationLabel = hasManualOpenings
     ? `${baseVentilationLabel} + manual openings`
     : baseVentilationLabel;
   const ventilationSummary = adaptiveVentEnabled
     ? `Adaptive ventilation: windows open automatically when cooling is beneficial (0.6-6.0 ACH).${manualWindowSummaryText}`
     : nightPurgeEnabled
-      ? `${activeVentPreset.label} by day, night purge at ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour (22:00-06:00).${manualWindowSummaryText}`
+      ? `${activeVentPreset.label} by day, smart night purge up to ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour (${String(NIGHT_START_HOUR).padStart(2, "0")}:00-${String(NIGHT_END_HOUR).padStart(2, "0")}:00) only when indoor is above ${COMFORT_BAND.max}°C and outdoor air is at least 1°C cooler.${manualWindowSummaryText}`
       : `${activeVentPreset.label} (${ventilationAchTotal.toFixed(1)} air changes per hour).${manualWindowSummaryText}`;
   const ventilationComfortSummary = `Draught comfort check: ${ventilationComfort.label} (apparent cooling ~${ventilationComfort.apparentCoolingC.toFixed(1)}°C, feels like ~${ventilationComfort.perceivedTempC.toFixed(1)}°C).`;
   const ventilationSummaryWithComfort = `${ventilationSummary} ${ventilationComfortSummary}`;
@@ -1071,7 +1070,7 @@ export default function App() {
         : `Rooflight: OFF`,
       `${ventilationComfort.label}: feels like ${ventilationComfort.perceivedTempC.toFixed(1)}°C (${ventilationComfort.apparentCoolingC.toFixed(1)}°C apparent cooling)`,
       `Adaptive mode: ${adaptiveVentEnabled ? "On" : "Off"}`,
-      `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : nightPurgeEnabled ? "On" : "Off"}`,
+      `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : nightPurgeEnabled ? (nightPurgeActiveAtTime ? "Enabled (active now)" : "Enabled (standby now)") : "Off"}`,
     ].join("\n");
 
     const chartNode = dailyChartContainerRef.current;
@@ -2894,7 +2893,7 @@ export default function App() {
                             <p className="text-xs text-slate-500">
                               {adaptiveVentEnabled
                                 ? "Adaptive mode handles night cooling automatically."
-                                : `Boost to ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour between ${String(NIGHT_START_HOUR).padStart(2, "0")}:00-${String(NIGHT_END_HOUR).padStart(2, "0")}:00.`}
+                                : `Smart boost up to ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} ACH between ${String(NIGHT_START_HOUR).padStart(2, "0")}:00-${String(NIGHT_END_HOUR).padStart(2, "0")}:00 when indoor is above ${COMFORT_BAND.max}°C and outdoor is at least 1°C cooler.`}
                             </p>
                           </div>
                           <Switch
@@ -2954,7 +2953,7 @@ export default function App() {
                               <span className="font-medium text-slate-700">{passivhausVentPreset?.label ?? "MVHR"}</span>{" "}
                               at {passivhausVentPreset?.achTotal?.toFixed?.(1) ?? "n/a"} ACH.
                             </li>
-                            <li>Night purge on (adds overnight cooling support from 22:00-06:00).</li>
+                            <li>Night purge off by default (enable seasonally when night cooling is beneficial).</li>
                             <li>
                               Facade defaults: smaller N/E/W glazing, larger south glazing, plus south overhang and
                               E/W fins to temper summer solar gains.
