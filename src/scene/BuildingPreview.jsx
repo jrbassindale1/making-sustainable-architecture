@@ -16,6 +16,7 @@ import {
   Object3D,
   RepeatWrapping,
   SRGBColorSpace,
+  TextureLoader,
   Vector2,
   Vector3,
 } from "three";
@@ -72,6 +73,12 @@ const LOW_POWER_TARGET_FPS = 12;
 const AUTO_LOW_FPS_THRESHOLD = 20;
 const AUTO_RECOVER_FPS_THRESHOLD = 24;
 const AUTO_FPS_SAMPLE_SECONDS = 2.5;
+const SOLAR_PANEL_THICKNESS_M = 0.035;
+const SOLAR_PANEL_BASE_OFFSET_M = 0.012;
+const SOLAR_PANEL_RAIL_THICKNESS_M = 0.014;
+const SOLAR_PANEL_RAIL_DEPTH_M = 0.045;
+const SOLAR_PANEL_LEG_SIZE_M = 0.03;
+const SOLAR_PANEL_BRACE_SIZE_M = 0.02;
 
 function configureTexture(texture, repeat, useSrgb = false) {
   if (!texture) return;
@@ -81,6 +88,61 @@ function configureTexture(texture, repeat, useSrgb = false) {
   texture.anisotropy = 8;
   if (useSrgb) texture.colorSpace = SRGBColorSpace;
   texture.needsUpdate = true;
+}
+
+function resolvePublicAssetUrl(path) {
+  if (!path) return "";
+  if (
+    path.startsWith("http://") ||
+    path.startsWith("https://") ||
+    path.startsWith("data:") ||
+    path.startsWith("blob:")
+  ) {
+    return path;
+  }
+  const baseUrl = import.meta.env.BASE_URL || "/";
+  const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const normalizedPath = String(path).replace(/^\/+/, "");
+  return `${normalizedBase}${normalizedPath}`;
+}
+
+function createSolarPanelFallbackTexture() {
+  if (typeof document === "undefined") return null;
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.fillStyle = "#173654";
+  ctx.fillRect(0, 0, size, size);
+
+  const cols = 6;
+  const rows = 10;
+  const line = 2;
+  const inset = 8;
+  const cellW = (size - inset * 2 - line * (cols - 1)) / cols;
+  const cellH = (size - inset * 2 - line * (rows - 1)) / rows;
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const x = inset + col * (cellW + line);
+      const y = inset + row * (cellH + line);
+      const grad = ctx.createLinearGradient(x, y, x + cellW, y + cellH);
+      grad.addColorStop(0, "#3f7fb3");
+      grad.addColorStop(1, "#285a82");
+      ctx.fillStyle = grad;
+      ctx.fillRect(x, y, cellW, cellH);
+      ctx.strokeStyle = "rgba(210,232,248,0.55)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, cellW - 1), Math.max(0, cellH - 1));
+    }
+  }
+
+  const texture = new CanvasTexture(canvas);
+  configureTexture(texture, [1, 1], true);
+  return texture;
 }
 
 function OperableWindowLeaf({
@@ -990,6 +1052,89 @@ function CompassFloorLabel({ label, color, position, size = 0.82 }) {
   );
 }
 
+function resolveRoofPatchSurfaces(
+  patchWidth,
+  patchDepth,
+  holeMinX,
+  holeMaxX,
+  holeMinZ,
+  holeMaxZ,
+  cutoutPadding = 0.03,
+) {
+  const safeW = Math.max(0.2, patchWidth);
+  const safeD = Math.max(0.2, patchDepth);
+  const halfW = safeW / 2;
+  const halfD = safeD / 2;
+  const surfaces = [];
+  const hasHole =
+    holeMinX !== null &&
+    holeMaxX !== null &&
+    holeMinZ !== null &&
+    holeMaxZ !== null;
+
+  if (!hasHole) {
+    return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
+  }
+
+  const minX = Math.max(-halfW, holeMinX - cutoutPadding);
+  const maxX = Math.min(halfW, holeMaxX + cutoutPadding);
+  const minZ = Math.max(-halfD, holeMinZ - cutoutPadding);
+  const maxZ = Math.min(halfD, holeMaxZ + cutoutPadding);
+  const eps = 0.001;
+
+  if (maxX <= minX + eps || maxZ <= minZ + eps) {
+    return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
+  }
+
+  const southDepth = minZ + halfD;
+  if (southDepth > eps) {
+    surfaces.push({
+      width: safeW,
+      depth: southDepth,
+      x: 0,
+      z: (-halfD + minZ) / 2,
+    });
+  }
+
+  const northDepth = halfD - maxZ;
+  if (northDepth > eps) {
+    surfaces.push({
+      width: safeW,
+      depth: northDepth,
+      x: 0,
+      z: (maxZ + halfD) / 2,
+    });
+  }
+
+  const midDepth = maxZ - minZ;
+  if (midDepth > eps) {
+    const westWidth = minX + halfW;
+    if (westWidth > eps) {
+      surfaces.push({
+        width: westWidth,
+        depth: midDepth,
+        x: (-halfW + minX) / 2,
+        z: (minZ + maxZ) / 2,
+      });
+    }
+
+    const eastWidth = halfW - maxX;
+    if (eastWidth > eps) {
+      surfaces.push({
+        width: eastWidth,
+        depth: midDepth,
+        x: (maxX + halfW) / 2,
+        z: (minZ + maxZ) / 2,
+      });
+    }
+  }
+
+  if (surfaces.length === 0) {
+    return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
+  }
+  return surfaces;
+}
+
 function RoofGrass({
   patchWidth,
   patchDepth,
@@ -1009,79 +1154,15 @@ function RoofGrass({
   const holeMinZ = rooflightHole?.minZ ?? null;
   const holeMaxZ = rooflightHole?.maxZ ?? null;
   const patchSurfaces = useMemo(() => {
-    const safeW = Math.max(0.2, patchWidth);
-    const safeD = Math.max(0.2, patchDepth);
-    const halfW = safeW / 2;
-    const halfD = safeD / 2;
-    const surfaces = [];
-    const hasHole =
-      holeMinX !== null &&
-      holeMaxX !== null &&
-      holeMinZ !== null &&
-      holeMaxZ !== null;
-
-    if (!hasHole) {
-      return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
-    }
-
-    const cutoutPadding = 0.03;
-    const minX = Math.max(-halfW, holeMinX - cutoutPadding);
-    const maxX = Math.min(halfW, holeMaxX + cutoutPadding);
-    const minZ = Math.max(-halfD, holeMinZ - cutoutPadding);
-    const maxZ = Math.min(halfD, holeMaxZ + cutoutPadding);
-    const eps = 0.001;
-
-    if (maxX <= minX + eps || maxZ <= minZ + eps) {
-      return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
-    }
-
-    const southDepth = minZ + halfD;
-    if (southDepth > eps) {
-      surfaces.push({
-        width: safeW,
-        depth: southDepth,
-        x: 0,
-        z: (-halfD + minZ) / 2,
-      });
-    }
-
-    const northDepth = halfD - maxZ;
-    if (northDepth > eps) {
-      surfaces.push({
-        width: safeW,
-        depth: northDepth,
-        x: 0,
-        z: (maxZ + halfD) / 2,
-      });
-    }
-
-    const midDepth = maxZ - minZ;
-    if (midDepth > eps) {
-      const westWidth = minX + halfW;
-      if (westWidth > eps) {
-        surfaces.push({
-          width: westWidth,
-          depth: midDepth,
-          x: (-halfW + minX) / 2,
-          z: (minZ + maxZ) / 2,
-        });
-      }
-
-      const eastWidth = halfW - maxX;
-      if (eastWidth > eps) {
-        surfaces.push({
-          width: eastWidth,
-          depth: midDepth,
-          x: (maxX + halfW) / 2,
-          z: (minZ + maxZ) / 2,
-        });
-      }
-    }
-
-    if (surfaces.length === 0) {
-      return [{ width: safeW, depth: safeD, x: 0, z: 0 }];
-    }
-    return surfaces;
+    return resolveRoofPatchSurfaces(
+      patchWidth,
+      patchDepth,
+      holeMinX,
+      holeMaxX,
+      holeMinZ,
+      holeMaxZ,
+      0.03,
+    );
   }, [patchWidth, patchDepth, holeMinX, holeMaxX, holeMinZ, holeMaxZ]);
   const roofMatTexture = useMemo(() => {
     const size = 256;
@@ -1408,6 +1489,53 @@ function RoofGrass({
   );
 }
 
+function RoofMembrane({
+  patchWidth,
+  patchDepth,
+  rooflightHole = null,
+  position = [0, 0, 0],
+}) {
+  const holeMinX = rooflightHole?.minX ?? null;
+  const holeMaxX = rooflightHole?.maxX ?? null;
+  const holeMinZ = rooflightHole?.minZ ?? null;
+  const holeMaxZ = rooflightHole?.maxZ ?? null;
+  const patchSurfaces = useMemo(
+    () =>
+      resolveRoofPatchSurfaces(
+        patchWidth,
+        patchDepth,
+        holeMinX,
+        holeMaxX,
+        holeMinZ,
+        holeMaxZ,
+        0.02,
+      ),
+    [patchWidth, patchDepth, holeMinX, holeMaxX, holeMinZ, holeMaxZ],
+  );
+
+  if (patchSurfaces.length === 0) return null;
+
+  return (
+    <group position={position}>
+      {patchSurfaces.map((surface, index) => (
+        <mesh
+          key={`roof-membrane-${index}`}
+          rotation={[-Math.PI / 2, 0, 0]}
+          position={[surface.x, 0.0015, surface.z]}
+          receiveShadow
+        >
+          <planeGeometry args={[surface.width, surface.depth]} />
+          <meshStandardMaterial
+            color="#8e949b"
+            roughness={0.92}
+            metalness={0.06}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
 function FacadeCladdingMesh({
   position,
   size,
@@ -1488,6 +1616,10 @@ function RoomModel({
   rooflightSpec,
   rooflightEnabled = true,
   onToggleRooflight,
+  solarPvEnabled = false,
+  solarPvPitchDeg = 12,
+  solarPvPatches = [],
+  solarPvTextureUrl = "/solar-panel-size-60-cell.jpg",
   downlightsOn = false,
   downlightIntensity = 60,
   downlightAngle = 0.95,
@@ -1606,6 +1738,10 @@ function RoomModel({
     if (!hasRooflight) return "";
     return resolvedRooflight.openHeight > 0.001 ? "tap to close" : "tap to open";
   }, [hasRooflight, resolvedRooflight.openHeight]);
+  const pvPitchRad = useMemo(() => {
+    const clampedDeg = Math.max(0, Math.min(45, Number.isFinite(solarPvPitchDeg) ? solarPvPitchDeg : 0));
+    return deg2rad(clampedDeg);
+  }, [solarPvPitchDeg]);
   const grassBaseColor = "#b9d7a5";
   const groundTintColor = useMemo(() => {
     const night = new Color("#121a12");
@@ -1825,6 +1961,78 @@ function RoomModel({
       side: FrontSide,
     }),
     [glassMaterialProps]
+  );
+  const solarPanelMaterialProps = useMemo(
+    () => ({
+      color: "#2a2f36",
+      roughness: 0.52,
+      metalness: 0.72,
+      clearcoat: 0.08,
+      clearcoatRoughness: 0.62,
+      envMapIntensity: 0.6,
+    }),
+    []
+  );
+  const solarPanelSupportMaterialProps = useMemo(
+    () => ({
+      color: "#a3adb9",
+      roughness: 0.44,
+      metalness: 0.82,
+      clearcoat: 0.22,
+      clearcoatRoughness: 0.38,
+      envMapIntensity: 0.72,
+    }),
+    []
+  );
+  const fallbackSolarPanelCellTexture = useMemo(() => createSolarPanelFallbackTexture(), []);
+  const [solarPanelCellTexture, setSolarPanelCellTexture] = useState(
+    fallbackSolarPanelCellTexture,
+  );
+  const resolvedSolarPvTextureUrl = useMemo(
+    () => resolvePublicAssetUrl(solarPvTextureUrl),
+    [solarPvTextureUrl],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    if (!resolvedSolarPvTextureUrl) {
+      setSolarPanelCellTexture(fallbackSolarPanelCellTexture);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const textureLoader = new TextureLoader();
+    textureLoader.load(
+      resolvedSolarPvTextureUrl,
+      (texture) => {
+        if (cancelled) return;
+        configureTexture(texture, [1, 1], true);
+        setSolarPanelCellTexture(texture);
+      },
+      undefined,
+      (error) => {
+        console.warn(
+          "[Solar PV] Panel texture load failed, using fallback texture:",
+          resolvedSolarPvTextureUrl,
+          error,
+        );
+        if (cancelled) return;
+        setSolarPanelCellTexture(fallbackSolarPanelCellTexture);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedSolarPvTextureUrl, fallbackSolarPanelCellTexture]);
+  const solarPanelSurfaceMaterialProps = useMemo(
+    () => ({
+      map: solarPanelCellTexture ?? undefined,
+      color: "#ffffff",
+      roughness: 0.52,
+      metalness: 0.05,
+      emissive: "#1b2d3f",
+      emissiveIntensity: 0.12,
+    }),
+    [solarPanelCellTexture]
   );
 
   const grassTexture = useMemo(() => {
@@ -2447,12 +2655,216 @@ function RoomModel({
           </mesh>
         )}
 
-        <RoofGrass
-          patchWidth={roofGrassWidth}
-          patchDepth={roofGrassDepth}
-          rooflightHole={roofGrassHole}
-          position={[roofOffsetX, height + FLOOR_THICKNESS + 0.003, roofOffsetZ]}
-        />
+        {solarPvEnabled ? (
+          <RoofMembrane
+            patchWidth={roofGrassWidth}
+            patchDepth={roofGrassDepth}
+            rooflightHole={roofGrassHole}
+            position={[roofOffsetX, height + FLOOR_THICKNESS + 0.002, roofOffsetZ]}
+          />
+        ) : (
+          <RoofGrass
+            patchWidth={roofGrassWidth}
+            patchDepth={roofGrassDepth}
+            rooflightHole={roofGrassHole}
+            position={[roofOffsetX, height + FLOOR_THICKNESS + 0.003, roofOffsetZ]}
+          />
+        )}
+
+        {solarPvEnabled && solarPvPatches.length > 0 && (
+          <group>
+            {solarPvPatches.map((patch, index) => {
+              const panelWidth = Math.max(0, Number.isFinite(patch?.width) ? patch.width : 0);
+              const panelDepth = Math.max(0, Number.isFinite(patch?.depth) ? patch.depth : 0);
+              if (panelWidth < 0.05 || panelDepth < 0.05) return null;
+              const panelX = Number.isFinite(patch?.centerX) ? patch.centerX : 0;
+              const panelZ = Number.isFinite(patch?.centerZ) ? patch.centerZ : 0;
+              const panelPitchRadAbs = Math.abs(pvPitchRad);
+              const sinPitch = Math.sin(panelPitchRadAbs);
+              const cosPitch = Math.cos(panelPitchRadAbs);
+              const pitchLift = sinPitch * (panelDepth / 2);
+              const panelCenterY =
+                height +
+                FLOOR_THICKNESS +
+                SOLAR_PANEL_BASE_OFFSET_M +
+                pitchLift +
+                SOLAR_PANEL_THICKNESS_M / 2;
+              const cellWidth = Math.max(0.04, panelWidth - 0.025);
+              const cellDepth = Math.max(0.04, panelDepth - 0.025);
+              const roofMountY = height + FLOOR_THICKNESS + 0.004;
+              const undersideLocalY = -SOLAR_PANEL_THICKNESS_M / 2;
+              const rearAttachZLocal = panelDepth * 0.34;
+              const frontAttachZLocal = -panelDepth * 0.34;
+              const braceAttachZLocal = panelDepth * 0.06;
+              const localToWorldY = (localY, localZ) =>
+                panelCenterY + localY * cosPitch + localZ * sinPitch;
+              const localToWorldZ = (localY, localZ) =>
+                panelZ - localY * sinPitch + localZ * cosPitch;
+
+              const rearRailY = localToWorldY(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.5,
+                rearAttachZLocal,
+              );
+              const rearRailZ = localToWorldZ(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.5,
+                rearAttachZLocal,
+              );
+              const frontRailY = localToWorldY(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.5,
+                frontAttachZLocal,
+              );
+              const frontRailZ = localToWorldZ(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.5,
+                frontAttachZLocal,
+              );
+
+              const legOffsetX = Math.max(0.06, panelWidth * 0.34);
+              const rearLegTopY = localToWorldY(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M,
+                rearAttachZLocal,
+              );
+              const rearLegZ = localToWorldZ(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M,
+                rearAttachZLocal,
+              );
+              const frontFootTopY = localToWorldY(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M,
+                frontAttachZLocal,
+              );
+              const frontFootZ = localToWorldZ(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M,
+                frontAttachZLocal,
+              );
+              const braceTargetY = localToWorldY(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.6,
+                braceAttachZLocal,
+              );
+              const braceTargetZ = localToWorldZ(
+                undersideLocalY - SOLAR_PANEL_RAIL_THICKNESS_M * 0.6,
+                braceAttachZLocal,
+              );
+              const rearLegHeight = Math.max(0.03, rearLegTopY - roofMountY);
+              const frontFootHeight = Math.max(0.012, frontFootTopY - roofMountY);
+              const braceRise = braceTargetY - rearLegTopY;
+              const braceRun = braceTargetZ - rearLegZ;
+              const braceLength = Math.hypot(braceRise, braceRun);
+              const braceAngle = Math.atan2(braceRise, braceRun);
+              const frameRailWidth = Math.max(0.08, panelWidth * 0.78);
+              return (
+                <group key={`solar-panel-${index}`}>
+                  <group
+                    position={[panelX, panelCenterY, panelZ]}
+                    rotation={[-panelPitchRadAbs, 0, 0]}
+                  >
+                    <mesh castShadow receiveShadow>
+                      <boxGeometry args={[panelWidth, SOLAR_PANEL_THICKNESS_M, panelDepth]} />
+                      <meshPhysicalMaterial {...solarPanelMaterialProps} />
+                    </mesh>
+                    <mesh
+                      position={[0, SOLAR_PANEL_THICKNESS_M / 2 + 0.0012, 0]}
+                      rotation={[-Math.PI / 2, 0, 0]}
+                      castShadow={false}
+                      receiveShadow={false}
+                      renderOrder={12}
+                    >
+                      <planeGeometry args={[cellWidth, cellDepth]} />
+                      <meshStandardMaterial
+                        {...solarPanelSurfaceMaterialProps}
+                        polygonOffset
+                        polygonOffsetFactor={-2}
+                        polygonOffsetUnits={-2}
+                      />
+                    </mesh>
+                  </group>
+
+                  {/* Rear and front rails under the module */}
+                  <mesh
+                    position={[panelX, rearRailY, rearRailZ]}
+                    rotation={[-panelPitchRadAbs, 0, 0]}
+                    castShadow
+                    receiveShadow
+                  >
+                    <boxGeometry
+                      args={[frameRailWidth, SOLAR_PANEL_RAIL_THICKNESS_M, SOLAR_PANEL_RAIL_DEPTH_M]}
+                    />
+                    <meshPhysicalMaterial {...solarPanelSupportMaterialProps} />
+                  </mesh>
+                  <mesh
+                    position={[panelX, frontRailY, frontRailZ]}
+                    rotation={[-panelPitchRadAbs, 0, 0]}
+                    castShadow
+                    receiveShadow
+                  >
+                    <boxGeometry
+                      args={[
+                        frameRailWidth * 0.96,
+                        SOLAR_PANEL_RAIL_THICKNESS_M,
+                        SOLAR_PANEL_RAIL_DEPTH_M * 0.8,
+                      ]}
+                    />
+                    <meshPhysicalMaterial {...solarPanelSupportMaterialProps} />
+                  </mesh>
+
+                  {[-1, 1].map((side) => {
+                    const supportX = panelX + side * legOffsetX;
+                    const rearLegCenterY = roofMountY + rearLegHeight / 2;
+                    const frontFootCenterY = roofMountY + frontFootHeight / 2;
+                    return (
+                      <group key={`solar-support-${index}-${side}`}>
+                        {/* Rear leg */}
+                        <mesh
+                          position={[supportX, rearLegCenterY, rearLegZ]}
+                          castShadow
+                          receiveShadow
+                        >
+                          <boxGeometry
+                            args={[SOLAR_PANEL_LEG_SIZE_M, rearLegHeight, SOLAR_PANEL_LEG_SIZE_M]}
+                          />
+                          <meshPhysicalMaterial {...solarPanelSupportMaterialProps} />
+                        </mesh>
+
+                        {/* Front foot */}
+                        <mesh
+                          position={[supportX, frontFootCenterY, frontFootZ]}
+                          castShadow
+                          receiveShadow
+                        >
+                          <boxGeometry
+                            args={[SOLAR_PANEL_LEG_SIZE_M, frontFootHeight, SOLAR_PANEL_LEG_SIZE_M]}
+                          />
+                          <meshPhysicalMaterial {...solarPanelSupportMaterialProps} />
+                        </mesh>
+
+                        {/* Diagonal rear brace */}
+                        {braceLength > 0.03 && (
+                          <mesh
+                            position={[
+                              supportX,
+                              (rearLegTopY + braceTargetY) / 2,
+                              (rearLegZ + braceTargetZ) / 2,
+                            ]}
+                            rotation={[-braceAngle, 0, 0]}
+                            castShadow
+                            receiveShadow
+                          >
+                            <boxGeometry
+                              args={[
+                                SOLAR_PANEL_BRACE_SIZE_M,
+                                SOLAR_PANEL_BRACE_SIZE_M * 0.65,
+                                braceLength,
+                              ]}
+                            />
+                            <meshPhysicalMaterial {...solarPanelSupportMaterialProps} />
+                          </mesh>
+                        )}
+                      </group>
+                    );
+                  })}
+                </group>
+              );
+            })}
+          </group>
+        )}
 
         {downlightLayout.map((position, index) => (
           <CeilingDownlight
@@ -3255,6 +3667,10 @@ export function BuildingPreview({
   rooflightSpec,
   rooflightEnabled = true,
   onToggleRooflight,
+  solarPvEnabled = false,
+  solarPvPitchDeg = 12,
+  solarPvPatches = [],
+  solarPvTextureUrl = "/solar-panel-size-60-cell.jpg",
   downlightsOn = false,
   downlightIntensity = 60,
   downlightAngle = 0.95,
@@ -3449,6 +3865,10 @@ export function BuildingPreview({
             rooflightSpec={rooflightSpec}
             rooflightEnabled={rooflightEnabled}
             onToggleRooflight={onToggleRooflight}
+            solarPvEnabled={solarPvEnabled}
+            solarPvPitchDeg={solarPvPitchDeg}
+            solarPvPatches={solarPvPatches}
+            solarPvTextureUrl={solarPvTextureUrl}
             downlightsOn={downlightsOn}
             downlightIntensity={downlightIntensity}
             downlightAngle={downlightAngle}

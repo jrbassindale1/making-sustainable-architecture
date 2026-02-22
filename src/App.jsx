@@ -57,6 +57,7 @@ import {
   calculateManualWindowVentilation,
   calculateOpeningArea,
   calculateOpenedWindowArea,
+  calculateRoofPlanDimensions,
   clampWindowCenterRatio,
   buildWindowsFromFaceState,
   cardinalFromAzimuth,
@@ -73,6 +74,7 @@ import {
   normalizedAzimuth,
   nextWindowSegmentState,
   normalizeWindowSegmentState,
+  planeIrradianceTilted,
   resolveRooflightConfig,
   resolveWindowOpeningHeight,
   simulateAnnual1R1C,
@@ -93,6 +95,7 @@ import {
 import {
   ComfortGuidanceCard,
   CostCarbonCard,
+  EnergyFlowCard,
   EnergyAssumptionsCard,
   EnvelopeAssumptionsCard,
   GainsLossesCard,
@@ -113,6 +116,38 @@ const DOWNLIGHT_BEAM_ANGLE_DEFAULT = 0.95;
 const DOWNLIGHT_PENUMBRA_DEFAULT = 1;
 const DOWNLIGHT_THROW_SCALE_DEFAULT = 2.5;
 const DOWNLIGHT_SOURCE_GLOW_DEFAULT = 2.5;
+const SOLAR_PV_COVERAGE_DEFAULT = 1;
+const SOLAR_PV_EFFICIENCY_DEFAULT = 0.2;
+const SOLAR_PV_PERFORMANCE_RATIO_DEFAULT = 0.75;
+const ROOF_PV_CLEARANCE_M = 0.15;
+const SOLAR_PANEL_GAP_M = 0.03;
+const SOLAR_PANEL_PRESETS = {
+  "60-cell": {
+    id: "60-cell",
+    label: "60-cell (residential)",
+    widthM: 1.0,
+    depthM: 1.7,
+    powerKW: 0.4,
+    textureUrl: "/solar-panel-size-60-cell.jpg",
+  },
+  "72-cell": {
+    id: "72-cell",
+    label: "72-cell (larger)",
+    widthM: 1.0,
+    depthM: 2.0,
+    powerKW: 0.48,
+    textureUrl: "/solar-panel-size-72-cell.jpg",
+  },
+};
+const EMPTY_ROOF_PV_LAYOUT = Object.freeze({
+  maxAreaM2: 0,
+  maxInstallableAreaM2: 0,
+  installedAreaM2: 0,
+  maxPanelCount: 0,
+  installedPanelCount: 0,
+  patches: [],
+});
+const DEFAULT_SOLAR_PANEL_PRESET = "60-cell";
 const STANDARD_SW_WIND_MPH = 5;
 const STANDARD_SW_WIND_MS = STANDARD_SW_WIND_MPH * 0.44704;
 const STANDARD_SW_WIND_DIR_DEG = 225;
@@ -134,6 +169,195 @@ const getAnalyticsErrorMessage = (error) => {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return "Unknown error";
+};
+const estimateOptimalPvPitchDeg = (latitudeDeg) => {
+  const absLat = Math.abs(Number.isFinite(latitudeDeg) ? latitudeDeg : 0);
+  let tilt = 0;
+  if (absLat <= 25) tilt = absLat * 0.87;
+  else if (absLat <= 50) tilt = absLat * 0.76 + 3.1;
+  else tilt = 40;
+  return Math.max(0, Math.min(45, Math.round(tilt)));
+};
+const estimateSolarPvGenerationKWh = ({
+  irradianceKWhM2,
+  panelAreaM2,
+  panelEfficiency,
+  performanceRatio,
+}) => {
+  const irradiance = Math.max(0, Number.isFinite(irradianceKWhM2) ? irradianceKWhM2 : 0);
+  const area = Math.max(0, Number.isFinite(panelAreaM2) ? panelAreaM2 : 0);
+  const efficiency = Math.max(0, Math.min(1, Number.isFinite(panelEfficiency) ? panelEfficiency : 0));
+  const pr = Math.max(0, Math.min(1, Number.isFinite(performanceRatio) ? performanceRatio : 0));
+  return irradiance * area * efficiency * pr;
+};
+const buildRect = (minX, maxX, minZ, maxZ, anchor = "center") => {
+  const width = maxX - minX;
+  const depth = maxZ - minZ;
+  if (width <= 1e-6 || depth <= 1e-6) return null;
+  return { minX, maxX, minZ, maxZ, width, depth, areaM2: width * depth, anchor };
+};
+const layoutFixedPanelsInZone = (zone, moduleWidthM, moduleDepthM, gapM) => {
+  const columns = Math.floor((zone.width + gapM) / (moduleWidthM + gapM));
+  const rows = Math.floor((zone.depth + gapM) / (moduleDepthM + gapM));
+  if (columns <= 0 || rows <= 0) return [];
+
+  const gridWidth = columns * moduleWidthM + Math.max(0, columns - 1) * gapM;
+  const gridDepth = rows * moduleDepthM + Math.max(0, rows - 1) * gapM;
+  const hasSinglePanel = columns === 1 && rows === 1;
+  const startX =
+    hasSinglePanel
+      ? (zone.minX + zone.maxX - gridWidth) / 2
+      : zone.anchor === "west"
+      ? zone.minX
+      : zone.anchor === "east"
+        ? zone.maxX - gridWidth
+        : (zone.minX + zone.maxX - gridWidth) / 2;
+  const startZ =
+    hasSinglePanel
+      ? (zone.minZ + zone.maxZ - gridDepth) / 2
+      : zone.anchor === "south"
+      ? zone.minZ
+      : zone.anchor === "north"
+        ? zone.maxZ - gridDepth
+        : (zone.minZ + zone.maxZ - gridDepth) / 2;
+
+  const panels = [];
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      panels.push({
+        centerX: startX + column * (moduleWidthM + gapM) + moduleWidthM / 2,
+        centerZ: startZ + row * (moduleDepthM + gapM) + moduleDepthM / 2,
+        width: moduleWidthM,
+        depth: moduleDepthM,
+      });
+    }
+  }
+  return panels;
+};
+const bestPanelLayoutForZone = (zone, panelWidthM, panelDepthM, gapM) => {
+  const landscape = layoutFixedPanelsInZone(zone, panelDepthM, panelWidthM, gapM);
+  // Strict mode: only allow landscape modules.
+  return landscape;
+};
+const resolveRoofPvLayout = ({
+  roofWidth,
+  roofDepth,
+  roofCenterX = 0,
+  roofCenterZ = 0,
+  rooflightEnabled,
+  rooflightSpec,
+  coverage = 0,
+  clearanceM = ROOF_PV_CLEARANCE_M,
+  panelWidthM = SOLAR_PANEL_PRESETS[DEFAULT_SOLAR_PANEL_PRESET].widthM,
+  panelDepthM = SOLAR_PANEL_PRESETS[DEFAULT_SOLAR_PANEL_PRESET].depthM,
+  panelGapM = SOLAR_PANEL_GAP_M,
+}) => {
+  const safeWidth = Math.max(0, Number.isFinite(roofWidth) ? roofWidth : 0);
+  const safeDepth = Math.max(0, Number.isFinite(roofDepth) ? roofDepth : 0);
+  const safeCenterX = Number.isFinite(roofCenterX) ? roofCenterX : 0;
+  const safeCenterZ = Number.isFinite(roofCenterZ) ? roofCenterZ : 0;
+  const safeClearance = Math.max(0, Number.isFinite(clearanceM) ? clearanceM : 0);
+  const clampedCoverage = Math.max(0, Math.min(1, Number.isFinite(coverage) ? coverage : 0));
+  const safePanelWidth = Math.max(
+    0.1,
+    Number.isFinite(panelWidthM)
+      ? panelWidthM
+      : SOLAR_PANEL_PRESETS[DEFAULT_SOLAR_PANEL_PRESET].widthM,
+  );
+  const safePanelDepth = Math.max(
+    0.1,
+    Number.isFinite(panelDepthM)
+      ? panelDepthM
+      : SOLAR_PANEL_PRESETS[DEFAULT_SOLAR_PANEL_PRESET].depthM,
+  );
+  const safePanelGap = Math.max(0, Number.isFinite(panelGapM) ? panelGapM : SOLAR_PANEL_GAP_M);
+
+  const innerMinX = safeCenterX - safeWidth / 2 + safeClearance;
+  const innerMaxX = safeCenterX + safeWidth / 2 - safeClearance;
+  const innerMinZ = safeCenterZ - safeDepth / 2 + safeClearance;
+  const innerMaxZ = safeCenterZ + safeDepth / 2 - safeClearance;
+  if (innerMaxX <= innerMinX || innerMaxZ <= innerMinZ) {
+    return EMPTY_ROOF_PV_LAYOUT;
+  }
+
+  let candidateZones = [buildRect(innerMinX, innerMaxX, innerMinZ, innerMaxZ, "center")].filter(Boolean);
+  if (rooflightEnabled) {
+    const rlWidth = Math.max(0, Number.isFinite(rooflightSpec?.width) ? rooflightSpec.width : 0);
+    const rlDepth = Math.max(0, Number.isFinite(rooflightSpec?.depth) ? rooflightSpec.depth : 0);
+    const rlCenterX = Number.isFinite(rooflightSpec?.centerX) ? rooflightSpec.centerX : 0;
+    const rlCenterZ = Number.isFinite(rooflightSpec?.centerZ) ? rooflightSpec.centerZ : 0;
+    if (rlWidth > 1e-6 && rlDepth > 1e-6) {
+      const obsMinX = Math.max(innerMinX, rlCenterX - rlWidth / 2 - safeClearance);
+      const obsMaxX = Math.min(innerMaxX, rlCenterX + rlWidth / 2 + safeClearance);
+      const obsMinZ = Math.max(innerMinZ, rlCenterZ - rlDepth / 2 - safeClearance);
+      const obsMaxZ = Math.min(innerMaxZ, rlCenterZ + rlDepth / 2 + safeClearance);
+      if (obsMaxX > obsMinX && obsMaxZ > obsMinZ) {
+        candidateZones = [
+          buildRect(innerMinX, innerMaxX, innerMinZ, obsMinZ, "south"),
+          buildRect(innerMinX, innerMaxX, obsMaxZ, innerMaxZ, "north"),
+          buildRect(innerMinX, obsMinX, obsMinZ, obsMaxZ, "west"),
+          buildRect(obsMaxX, innerMaxX, obsMinZ, obsMaxZ, "east"),
+        ].filter(Boolean);
+      }
+    }
+  }
+
+  const maxAreaM2 = candidateZones.reduce((sum, zone) => sum + zone.areaM2, 0);
+  const zoneLayouts = candidateZones.map((zone) => ({
+    zone,
+    panels: bestPanelLayoutForZone(zone, safePanelWidth, safePanelDepth, safePanelGap),
+  }));
+  const maxPanelCount = zoneLayouts.reduce((sum, item) => sum + item.panels.length, 0);
+  const requestedPanelCount =
+    clampedCoverage <= 0 || maxPanelCount <= 0
+      ? 0
+      : Math.max(1, Math.min(maxPanelCount, Math.round(maxPanelCount * clampedCoverage)));
+  let remainingPanelCount = Math.min(maxPanelCount, requestedPanelCount);
+  const patches = [];
+  if (remainingPanelCount === 1) {
+    let centeredPanel = null;
+    let centeredPanelDistance = Number.POSITIVE_INFINITY;
+    zoneLayouts.forEach((item) => {
+      item.panels.forEach((panel) => {
+        const dx = panel.centerX - safeCenterX;
+        const dz = panel.centerZ - safeCenterZ;
+        const distance = dx * dx + dz * dz;
+        if (distance < centeredPanelDistance) {
+          centeredPanel = panel;
+          centeredPanelDistance = distance;
+        }
+      });
+    });
+    if (centeredPanel) {
+      patches.push(centeredPanel);
+      remainingPanelCount = 0;
+    }
+  }
+  if (remainingPanelCount > 0) {
+    [...zoneLayouts]
+      .sort((a, b) => b.zone.areaM2 - a.zone.areaM2)
+      .forEach((item) => {
+        if (remainingPanelCount <= 0) return;
+        const take = Math.min(item.panels.length, remainingPanelCount);
+        if (take > 0) patches.push(...item.panels.slice(0, take));
+        remainingPanelCount -= take;
+      });
+  }
+
+  const maxInstallableAreaM2 = zoneLayouts.reduce(
+    (sum, item) =>
+      sum + item.panels.reduce((panelSum, panel) => panelSum + panel.width * panel.depth, 0),
+    0,
+  );
+  const installedAreaM2 = patches.reduce((sum, patch) => sum + patch.width * patch.depth, 0);
+  return {
+    maxAreaM2,
+    maxInstallableAreaM2,
+    installedAreaM2,
+    maxPanelCount,
+    installedPanelCount: patches.length,
+    patches,
+  };
 };
 
 export default function App() {
@@ -191,15 +415,26 @@ export default function App() {
     openHeight: 0,
   });
   const [rooflightEnabled, setRooflightEnabled] = useState(true);
-  const [downlightIntensity, setDownlightIntensity] = useState(DOWNLIGHT_INTENSITY_DEFAULT);
-  const [downlightBeamAngle, setDownlightBeamAngle] = useState(DOWNLIGHT_BEAM_ANGLE_DEFAULT);
-  const [downlightPenumbra, setDownlightPenumbra] = useState(DOWNLIGHT_PENUMBRA_DEFAULT);
-  const [downlightThrowScale, setDownlightThrowScale] = useState(DOWNLIGHT_THROW_SCALE_DEFAULT);
-  const [downlightSourceGlow, setDownlightSourceGlow] = useState(DOWNLIGHT_SOURCE_GLOW_DEFAULT);
+  const [solarPvEnabled, setSolarPvEnabled] = useState(false);
+  const [solarPvCoverage, setSolarPvCoverage] = useState(SOLAR_PV_COVERAGE_DEFAULT);
+  const [solarPvEfficiency, setSolarPvEfficiency] = useState(SOLAR_PV_EFFICIENCY_DEFAULT);
+  const [solarPvPerformanceRatio, setSolarPvPerformanceRatio] = useState(
+    SOLAR_PV_PERFORMANCE_RATIO_DEFAULT,
+  );
+  const [solarPvPitchDeg, setSolarPvPitchDeg] = useState(
+    () => estimateOptimalPvPitchDeg(DEFAULT_SITE.latitude),
+  );
+  const [solarPvPanelPreset, setSolarPvPanelPreset] = useState(DEFAULT_SOLAR_PANEL_PRESET);
+  const downlightIntensity = DOWNLIGHT_INTENSITY_DEFAULT;
+  const downlightBeamAngle = DOWNLIGHT_BEAM_ANGLE_DEFAULT;
+  const downlightPenumbra = DOWNLIGHT_PENUMBRA_DEFAULT;
+  const downlightThrowScale = DOWNLIGHT_THROW_SCALE_DEFAULT;
+  const downlightSourceGlow = DOWNLIGHT_SOURCE_GLOW_DEFAULT;
   const [viewMode, setViewMode] = useState("explore");
   const [exploreTab, setExploreTab] = useState("context");
   const [ventilationPreset, setVentilationPreset] = useState(DEFAULT_VENTILATION_PRESET);
   const [nightPurgeEnabled, setNightPurgeEnabled] = useState(false);
+  const [mvhrAutoControlEnabled, setMvhrAutoControlEnabled] = useState(false);
   const [uValuePreset, setUValuePreset] = useState(DEFAULT_U_VALUE_PRESET);
   const [dayOfYear, setDayOfYear] = useState(initialSolsticeDay);
   const [timeFrac, setTimeFrac] = useState(MIDDAY_TIME_FRAC);
@@ -315,16 +550,26 @@ export default function App() {
       u_value_preset: uValuePreset,
       ventilation_preset: ventilationPreset,
       night_purge: nightPurgeEnabled ? "on" : "off",
+      mvhr_auto_control: mvhrAutoControlEnabled ? "on" : "off",
       rooflight_enabled: rooflightEnabled ? "on" : "off",
+      solar_pv_enabled: solarPvEnabled ? "on" : "off",
+      solar_pv_coverage_pct: Math.round(solarPvCoverage * 100),
+      solar_pv_pitch_deg: Math.round(solarPvPitchDeg),
+      solar_pv_module: solarPvPanelPreset,
       manual_open_sashes: Object.keys(openWindowSegments).length,
     }),
     [
       effectiveWeatherMode,
       exploreTab,
+      mvhrAutoControlEnabled,
       nightPurgeEnabled,
       openWindowSegments,
       orientationDeg,
       rooflightEnabled,
+      solarPvCoverage,
+      solarPvEnabled,
+      solarPvPanelPreset,
+      solarPvPitchDeg,
       uValuePreset,
       ventilationPreset,
       viewMode,
@@ -354,6 +599,22 @@ export default function App() {
     }
     return `Global climatology (${weatherMeta.name})`;
   }, [effectiveWeatherMode, weatherMeta.name]);
+  const optimalSolarPvPitchDeg = useMemo(
+    () => estimateOptimalPvPitchDeg(weatherMeta.latitude),
+    [weatherMeta.latitude],
+  );
+  const activeSolarPanelPreset = useMemo(
+    () =>
+      SOLAR_PANEL_PRESETS[solarPvPanelPreset] ??
+      SOLAR_PANEL_PRESETS[DEFAULT_SOLAR_PANEL_PRESET],
+    [solarPvPanelPreset],
+  );
+
+  useEffect(() => {
+    setSolarPvPitchDeg((prev) =>
+      Math.abs(prev - optimalSolarPvPitchDeg) < 1e-6 ? prev : optimalSolarPvPitchDeg,
+    );
+  }, [optimalSolarPvPitchDeg]);
 
   const seasonalMarks = useMemo(() => {
     const isNorthern = weatherMeta.latitude >= 0;
@@ -445,6 +706,12 @@ export default function App() {
   const ventilationAchTotal = activeVentPreset.achTotal;
   const ventilationHeatRecovery = activeVentPreset.heatRecoveryEfficiency ?? 0;
   const adaptiveVentEnabled = activeVentPreset.isAdaptive === true;
+  const mvhrControlAvailable = !adaptiveVentEnabled && ventilationHeatRecovery > 0;
+
+  useEffect(() => {
+    if (mvhrControlAvailable || !mvhrAutoControlEnabled) return;
+    setMvhrAutoControlEnabled(false);
+  }, [mvhrAutoControlEnabled, mvhrControlAvailable]);
 
   const selectedDate = useMemo(() => dateFromDayOfYearUTC(dayOfYear), [dayOfYear]);
   const selectedDateLabel = useMemo(
@@ -526,7 +793,78 @@ export default function App() {
     }),
     [rooflightEnabled, rooflightSpec.width, rooflightSpec.depth, activeUValues.window],
   );
+  const roofPlanDimensions = useMemo(
+    () => calculateRoofPlanDimensions({ width: buildingWidth, depth: buildingDepth }),
+    [buildingWidth, buildingDepth],
+  );
+  const roofPvGeometry = useMemo(() => {
+    const southOverhang = Math.max(
+      0,
+      Number.isFinite(previewFaceConfigs?.south?.overhang) ? previewFaceConfigs.south.overhang : 0,
+    );
+    const northOverhang = Math.max(
+      0,
+      Number.isFinite(previewFaceConfigs?.north?.overhang) ? previewFaceConfigs.north.overhang : 0,
+    );
+    const eastOverhang = Math.max(
+      0,
+      Number.isFinite(previewFaceConfigs?.east?.overhang) ? previewFaceConfigs.east.overhang : 0,
+    );
+    const westOverhang = Math.max(
+      0,
+      Number.isFinite(previewFaceConfigs?.west?.overhang) ? previewFaceConfigs.west.overhang : 0,
+    );
+    return {
+      roofWidth: roofPlanDimensions.roofWidth + eastOverhang + westOverhang,
+      roofDepth: roofPlanDimensions.roofDepth + southOverhang + northOverhang,
+      roofCenterX: (eastOverhang - westOverhang) / 2,
+      roofCenterZ: (northOverhang - southOverhang) / 2,
+    };
+  }, [previewFaceConfigs, roofPlanDimensions.roofDepth, roofPlanDimensions.roofWidth]);
   const hasRooflightOpen = rooflightEnabled && rooflightSpec.isOpen;
+  const roofPvLayout = useMemo(
+    () => {
+      try {
+        return resolveRoofPvLayout({
+          roofWidth: roofPvGeometry.roofWidth,
+          roofDepth: roofPvGeometry.roofDepth,
+          roofCenterX: roofPvGeometry.roofCenterX,
+          roofCenterZ: roofPvGeometry.roofCenterZ,
+          rooflightEnabled,
+          rooflightSpec,
+          coverage: solarPvCoverage,
+          clearanceM: ROOF_PV_CLEARANCE_M,
+          panelWidthM: activeSolarPanelPreset.widthM,
+          panelDepthM: activeSolarPanelPreset.depthM,
+          panelGapM: SOLAR_PANEL_GAP_M,
+        });
+      } catch (error) {
+        console.warn("[Solar PV] Roof layout fallback triggered:", error);
+        return EMPTY_ROOF_PV_LAYOUT;
+      }
+    },
+    [
+      roofPvGeometry.roofCenterX,
+      roofPvGeometry.roofCenterZ,
+      roofPvGeometry.roofDepth,
+      roofPvGeometry.roofWidth,
+      rooflightEnabled,
+      rooflightSpec,
+      solarPvCoverage,
+      activeSolarPanelPreset.widthM,
+      activeSolarPanelPreset.depthM,
+    ],
+  );
+  const pvSurfaceAzimuthDeg = useMemo(
+    () => normalizedAzimuth(180 + orientationDeg),
+    [orientationDeg],
+  );
+  const availableRoofAreaForPvM2 = roofPvLayout.maxAreaM2;
+  const maxInstallablePvAreaM2 = roofPvLayout.maxInstallableAreaM2;
+  const maxInstallablePvPanelCount = roofPvLayout.maxPanelCount;
+  const installedPvPanelCount = solarPvEnabled ? roofPvLayout.installedPanelCount : 0;
+  const installedPvAreaM2 = solarPvEnabled ? roofPvLayout.installedAreaM2 : 0;
+  const solarPvPatches = solarPvEnabled ? roofPvLayout.patches : [];
   const rooflightSizeLimits = useMemo(
     () => ({ minSize: ROOFLIGHT_MIN_CLEAR_SPAN_M, maxWidth: rooflightSpec.maxWidth, maxDepth: rooflightSpec.maxDepth }),
     [rooflightSpec.maxWidth, rooflightSpec.maxDepth],
@@ -561,7 +899,8 @@ export default function App() {
   const applyPassivhausOverride = useCallback(() => {
     setUValuePreset(PASSIVHAUS_U_VALUE_PRESET);
     setVentilationPreset(PASSIVHAUS_VENTILATION_PRESET);
-    setNightPurgeEnabled(true);
+    setNightPurgeEnabled(false);
+    setMvhrAutoControlEnabled(true);
     setFaceState({
       north: { ...PASSIVHAUS_FACE_STATE.north },
       east: { ...PASSIVHAUS_FACE_STATE.east },
@@ -711,6 +1050,22 @@ export default function App() {
       enabled: enabled ? "true" : "false",
     });
   }, [buildAnalyticsContext, trackAnalyticsEvent]);
+  const handleSolarPvEnabledChange = useCallback((enabled) => {
+    setSolarPvEnabled(enabled);
+    trackAnalyticsEvent("solar_pv_enabled_changed", {
+      ...buildAnalyticsContext(),
+      enabled: enabled ? "true" : "false",
+    });
+  }, [buildAnalyticsContext, trackAnalyticsEvent]);
+  const handleSolarPvPanelPresetChange = useCallback((presetId) => {
+    if (!SOLAR_PANEL_PRESETS[presetId]) return;
+    if (solarPvPanelPreset === presetId) return;
+    setSolarPvPanelPreset(presetId);
+    trackAnalyticsEvent("solar_pv_module_changed", {
+      ...buildAnalyticsContext(),
+      module_type: presetId,
+    });
+  }, [buildAnalyticsContext, solarPvPanelPreset, trackAnalyticsEvent]);
 
   const toggleWindowSegment = useCallback((faceId, segmentIndex) => {
     const key = `${faceId}:${segmentIndex}`;
@@ -768,6 +1123,7 @@ export default function App() {
     () => ({ ...baseParamsTemplate, windows }),
     [baseParamsTemplate, windows],
   );
+  const pvGroundAlbedo = Number.isFinite(baseParams.groundAlbedo) ? baseParams.groundAlbedo : 0.25;
   const epwFallbackProfile = useMemo(() => {
     if (!epwDataset?.meta) return climatologyProfile;
     return inferClimatologyFromLocation({
@@ -827,6 +1183,7 @@ export default function App() {
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
         heatRecoveryEfficiency: ventilationHeatRecovery,
+        mvhrControlEnabled: mvhrAutoControlEnabled,
         manualVentilationInput,
         nightPurgeEnabled,
         adaptiveVentEnabled,
@@ -837,6 +1194,7 @@ export default function App() {
       weatherProvider,
       ventilationAchTotal,
       ventilationHeatRecovery,
+      mvhrAutoControlEnabled,
       manualVentilationInput,
       nightPurgeEnabled,
       adaptiveVentEnabled,
@@ -943,6 +1301,8 @@ export default function App() {
         ? "Outdoor temperature, cloud cover, and wind come from your manual weather override at this location."
         : "Outdoor temperature, cloud cover, and wind come from a location-based climatology estimate.";
   const adaptiveReason = selectedPoint?.adaptiveReason;
+  const mvhrMode = selectedPoint?.mvhrMode;
+  const mvhrBypassActive = selectedPoint?.mvhrBypassActive === true;
   const baseVentilationLabel = adaptiveVentEnabled
     ? adaptiveReason === "day-cooling"
       ? "Adaptive (cooling)"
@@ -953,6 +1313,12 @@ export default function App() {
           : adaptiveReason === "outdoor-warm"
             ? "Adaptive (outdoor warm)"
             : "Adaptive (comfortable)"
+    : mvhrAutoControlEnabled && mvhrControlAvailable
+      ? mvhrMode === "summer-bypass"
+        ? "MVHR auto (summer bypass)"
+        : mvhrMode === "boost"
+          ? "MVHR auto (boost)"
+          : "MVHR auto (base)"
     : nightPurgeEnabled && isNightTime
       ? "Night purge"
       : activeVentPreset.label;
@@ -961,6 +1327,8 @@ export default function App() {
     : baseVentilationLabel;
   const ventilationSummary = adaptiveVentEnabled
     ? `Adaptive ventilation: windows open automatically when cooling is beneficial (0.6-6.0 ACH).${manualWindowSummaryText}`
+    : mvhrAutoControlEnabled && mvhrControlAvailable
+      ? `MVHR auto control: base ${ventilationAchTotal.toFixed(1)} ACH, boost during likely occupied periods, and summer bypass when outdoor air can cool the room.${mvhrBypassActive ? " Bypass is active at the selected time." : ""}${manualWindowSummaryText}`
     : nightPurgeEnabled
       ? `${activeVentPreset.label} by day, night purge at ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour (22:00-06:00).${manualWindowSummaryText}`
       : `${activeVentPreset.label} (${ventilationAchTotal.toFixed(1)} air changes per hour).${manualWindowSummaryText}`;
@@ -971,7 +1339,11 @@ export default function App() {
   const snapshot = useMemo(() => {
     const indoorTempOverride = selectedPoint?.T_in;
     // Heat recovery only applies when using mechanical ventilation without manual window openings
-    const effectiveHeatRecovery = hasManualOpenings ? 0 : ventilationHeatRecovery;
+    const effectiveHeatRecovery = hasManualOpenings
+      ? 0
+      : Number.isFinite(selectedPoint?.effectiveHeatRecovery)
+        ? selectedPoint.effectiveHeatRecovery
+        : ventilationHeatRecovery;
     return computeSnapshot({
       ...baseParams,
       dateMidday: dateAtTime,
@@ -986,7 +1358,7 @@ export default function App() {
           : undefined,
       T_room_override: indoorTempOverride,
     });
-  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, ventilationHeatRecovery, hasManualOpenings, currentForcing, selectedPoint?.T_in]);
+  }, [baseParams, dateAtTime, outdoorTemp, achTotalAtTime, ventilationHeatRecovery, hasManualOpenings, currentForcing, selectedPoint?.T_in, selectedPoint?.effectiveHeatRecovery]);
   const downlightsOn = useMemo(() => {
     const rawHour =
       Number.isFinite(selectedHour) ? selectedHour : dateAtTime.getUTCHours();
@@ -1033,14 +1405,55 @@ export default function App() {
     );
   }, [daySeries, daySimulation.stepMinutes]);
 
+  const daySolarIrradianceKWhM2 = useMemo(() => {
+    if (daySeries.length <= 1) return 0;
+    const stepHours = (daySimulation.stepMinutes || SIMULATION_STEP_MINUTES) / 60;
+    return daySeries.slice(0, -1).reduce((sum, point) => {
+      const { I_beam, I_diff, I_gnd } = planeIrradianceTilted({
+        tiltDeg: solarPvPitchDeg,
+        surfaceAzimuthDeg: pvSurfaceAzimuthDeg,
+        altitudeDeg: point.solarAltitudeDeg,
+        azimuthDeg: point.solarAzimuthDeg,
+        DNI: point.DNI,
+        DHI: point.DHI,
+        GHI: point.GHI,
+        groundAlbedo: pvGroundAlbedo,
+      });
+      return sum + ((I_beam + I_diff + I_gnd) * stepHours) / 1000;
+    }, 0);
+  }, [
+    daySeries,
+    daySimulation.stepMinutes,
+    solarPvPitchDeg,
+    pvSurfaceAzimuthDeg,
+    pvGroundAlbedo,
+  ]);
+  const daySolarPvGenerationKWh = useMemo(
+    () =>
+      estimateSolarPvGenerationKWh({
+        irradianceKWhM2: daySolarIrradianceKWhM2,
+        panelAreaM2: installedPvAreaM2,
+        panelEfficiency: solarPvEfficiency,
+        performanceRatio: solarPvPerformanceRatio,
+      }),
+    [
+      daySolarIrradianceKWhM2,
+      installedPvAreaM2,
+      solarPvEfficiency,
+      solarPvPerformanceRatio,
+    ],
+  );
+
   const dayCostSummary = useMemo(() => {
     if (!daySummary) return null;
     return computeCostCarbonSummary({
       heatingThermalKWh: daySummary.heatingEnergyKWh,
       coolingThermalKWh: daySummary.coolingEnergyKWh,
       days: 1,
+      onSiteSolarKWh: daySolarPvGenerationKWh,
+      floorAreaM2: buildingFloorArea,
     });
-  }, [daySummary]);
+  }, [daySummary, daySolarPvGenerationKWh, buildingFloorArea]);
 
   const formatDateStamp = (date) => date.toISOString().slice(0, 10);
   const formatExportStamp = () =>
@@ -1161,7 +1574,8 @@ export default function App() {
         : `Rooflight: OFF`,
       `${ventilationComfort.label}: feels like ${ventilationComfort.perceivedTempC.toFixed(1)}°C (${ventilationComfort.apparentCoolingC.toFixed(1)}°C apparent cooling)`,
       `Adaptive mode: ${adaptiveVentEnabled ? "On" : "Off"}`,
-      `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : nightPurgeEnabled ? "On" : "Off"}`,
+      `MVHR auto control: ${mvhrAutoControlEnabled && mvhrControlAvailable ? "On" : "Off"}`,
+      `Night purge: ${adaptiveVentEnabled ? "Controlled by adaptive mode" : mvhrAutoControlEnabled && mvhrControlAvailable ? "Off (MVHR auto active)" : nightPurgeEnabled ? "On" : "Off"}`,
     ].join("\n");
 
     const chartNode = dailyChartContainerRef.current;
@@ -1558,6 +1972,8 @@ export default function App() {
     }
   };
 
+  // Annual simulation always uses adaptive ventilation for realistic occupant behaviour
+  // (people naturally open windows when it's hot and beneficial for cooling)
   const annualCurrent = useMemo(
     () =>
       simulateAnnual1R1C(baseParams, weatherProvider, {
@@ -1565,9 +1981,15 @@ export default function App() {
         thermalCapacitance: THERMAL_CAPACITANCE_J_PER_K,
         achTotal: ventilationAchTotal,
         heatRecoveryEfficiency: ventilationHeatRecovery,
+        mvhrControlEnabled: mvhrAutoControlEnabled,
         manualVentilationInput,
         nightPurgeEnabled,
-        adaptiveVentEnabled,
+        adaptiveVentEnabled: true,
+        pvModel: {
+          tiltDeg: solarPvPitchDeg,
+          surfaceAzimuthDeg: pvSurfaceAzimuthDeg,
+          groundAlbedo: pvGroundAlbedo,
+        },
         spinupHours: effectiveSpinupDays * 24,
       }),
     [
@@ -1575,20 +1997,75 @@ export default function App() {
       weatherProvider,
       ventilationAchTotal,
       ventilationHeatRecovery,
+      mvhrAutoControlEnabled,
       manualVentilationInput,
       nightPurgeEnabled,
-      adaptiveVentEnabled,
+      solarPvPitchDeg,
+      pvSurfaceAzimuthDeg,
+      pvGroundAlbedo,
       effectiveSpinupDays,
     ],
   );
 
   const annualCostSummary = useMemo(() => {
     if (!annualCurrent) return null;
+    const annualSolarIrradianceKWhM2 = Number.isFinite(annualCurrent.metrics.tiltedPlaneIrradianceKWhM2)
+      ? Math.max(0, annualCurrent.metrics.tiltedPlaneIrradianceKWhM2)
+      : Number.isFinite(annualCurrent.metrics.globalHorizontalIrradianceKWhM2)
+        ? Math.max(0, annualCurrent.metrics.globalHorizontalIrradianceKWhM2)
+        : 0;
+    const annualSolarPvGenerationKWh = estimateSolarPvGenerationKWh({
+      irradianceKWhM2: annualSolarIrradianceKWhM2,
+      panelAreaM2: installedPvAreaM2,
+      panelEfficiency: solarPvEfficiency,
+      performanceRatio: solarPvPerformanceRatio,
+    });
     return computeCostCarbonSummary({
       heatingThermalKWh: annualCurrent.metrics.heatingEnergyKWh,
       coolingThermalKWh: annualCurrent.metrics.coolingEnergyKWh,
       days: DAYS_PER_YEAR,
+      onSiteSolarKWh: annualSolarPvGenerationKWh,
+      floorAreaM2: buildingFloorArea,
     });
+  }, [annualCurrent, installedPvAreaM2, solarPvEfficiency, solarPvPerformanceRatio, buildingFloorArea]);
+  const annualOperationalCarbonNetZero = Boolean(
+    annualCostSummary && annualCostSummary.carbonKg <= 0.01,
+  );
+  const annualHourMetrics = useMemo(() => {
+    if (!annualCurrent) return null;
+    const totalHours = DAYS_PER_YEAR * 24;
+    const comfortHoursRaw = Number.isFinite(annualCurrent.metrics.hoursInComfort)
+      ? Math.max(0, annualCurrent.metrics.hoursInComfort)
+      : 0;
+    const tooColdHoursRaw = Number.isFinite(annualCurrent.metrics.tooColdHours)
+      ? Math.max(0, annualCurrent.metrics.tooColdHours)
+      : 0;
+    const over26HoursRaw = Number.isFinite(annualCurrent.metrics.overheatingHours26)
+      ? Math.max(0, annualCurrent.metrics.overheatingHours26)
+      : 0;
+    const over28HoursRaw = Number.isFinite(annualCurrent.metrics.overheatingHours28)
+      ? Math.max(0, annualCurrent.metrics.overheatingHours28)
+      : 0;
+    const over26to28HoursRaw = Math.max(0, over26HoursRaw - over28HoursRaw);
+    const warm23to26HoursRaw = Math.max(
+      0,
+      totalHours - comfortHoursRaw - tooColdHoursRaw - over26HoursRaw,
+    );
+    const toHourMetric = (hours) => {
+      const safeHours = Number.isFinite(hours) ? Math.max(0, hours) : 0;
+      const pct = totalHours > 0 ? (safeHours / totalHours) * 100 : 0;
+      return {
+        value: `${Math.round(safeHours)} h`,
+        helper: `${pct.toFixed(1)}% of year`,
+      };
+    };
+    return {
+      comfort: toHourMetric(comfortHoursRaw),
+      tooCold: toHourMetric(tooColdHoursRaw),
+      warm23to26: toHourMetric(warm23to26HoursRaw),
+      over26to28: toHourMetric(over26to28HoursRaw),
+      over28: toHourMetric(over28HoursRaw),
+    };
   }, [annualCurrent]);
 
   const sunDirection = useMemo(() => {
@@ -1663,6 +2140,7 @@ export default function App() {
     { id: "context", label: "Context" },
     { id: "general", label: "General settings" },
     { id: "glazing", label: "Glazing" },
+    { id: "roof", label: "Roof" },
     { id: "shading", label: "Shading" },
     { id: "fabric", label: "Fabric (U values)" },
     { id: "ventilation", label: "Ventilation" },
@@ -1786,6 +2264,15 @@ export default function App() {
       enabled: enabled ? "true" : "false",
     });
   }, [nightPurgeEnabled, trackAnalyticsEvent]);
+  const handleMvhrAutoControlChange = useCallback((enabled) => {
+    if (mvhrAutoControlEnabled === enabled) return;
+    setMvhrAutoControlEnabled(enabled);
+    if (enabled) setNightPurgeEnabled(false);
+    trackAnalyticsEvent("mvhr_auto_control_toggled", {
+      enabled: enabled ? "true" : "false",
+      ventilation_preset: ventilationPreset,
+    });
+  }, [mvhrAutoControlEnabled, ventilationPreset, trackAnalyticsEvent]);
   const handleForceLowPerfModelChange = useCallback((enabled) => {
     if (forceLowPerfModel === enabled) return;
     setForceLowPerfModel(enabled);
@@ -1894,6 +2381,10 @@ export default function App() {
                       rooflightSpec={rooflightSpec}
                       rooflightEnabled={rooflightEnabled}
                       onToggleRooflight={toggleRooflightOpen}
+                      solarPvEnabled={solarPvEnabled}
+                      solarPvPitchDeg={solarPvPitchDeg}
+                      solarPvPatches={solarPvPatches}
+                      solarPvTextureUrl={activeSolarPanelPreset.textureUrl}
                       downlightsOn={downlightsOn}
                       downlightIntensity={downlightIntensity}
                       downlightAngle={downlightBeamAngle}
@@ -2208,6 +2699,23 @@ export default function App() {
                       )}
                     </div>
                   </Card>
+
+                  <EnergyFlowCard
+                    snapshot={snapshot}
+                    internalGain={baseParams.Q_internal}
+                    heatingW={selectedPoint?.heatingW ?? 0}
+                    coolingW={selectedPoint?.coolingW ?? 0}
+                    className="lg:col-span-2"
+                    info={
+                      <>
+                        <p>Snaky links show instantaneous heat flow in watts at the selected hour.</p>
+                        <p className="mt-1">
+                          Inputs (solar, internal, heating) feed the room node, then losses leave via
+                          the envelope, ventilation, or active cooling.
+                        </p>
+                      </>
+                    }
+                  />
                 </div>
 
                 <details
@@ -2291,6 +2799,10 @@ export default function App() {
                   rooflightSpec={rooflightSpec}
                   rooflightEnabled={rooflightEnabled}
                   onToggleRooflight={toggleRooflightOpen}
+                  solarPvEnabled={solarPvEnabled}
+                  solarPvPitchDeg={solarPvPitchDeg}
+                  solarPvPatches={solarPvPatches}
+                  solarPvTextureUrl={activeSolarPanelPreset.textureUrl}
                   downlightsOn={downlightsOn}
                   downlightIntensity={downlightIntensity}
                   downlightAngle={downlightBeamAngle}
@@ -2312,6 +2824,13 @@ export default function App() {
                     depth: buildingDepth,
                     height: buildingHeight,
                   }}
+                />
+
+                <EnergyFlowCard
+                  snapshot={snapshot}
+                  internalGain={baseParams.Q_internal}
+                  heatingW={selectedPoint?.heatingW ?? 0}
+                  coolingW={selectedPoint?.coolingW ?? 0}
                 />
 
                 <ComfortGuidanceCard
@@ -2404,6 +2923,7 @@ export default function App() {
                   title="Annual cost + carbon"
                   periodLabel="Full year (8,760 h)"
                   summary={annualCostSummary}
+                  isAnnual
                 />
 
                 <Card className="space-y-4 p-5">
@@ -2412,12 +2932,40 @@ export default function App() {
                     <p className="text-xs text-slate-500">Full year simulation (8,760 hours)</p>
                   </div>
                   <p className="text-xs text-slate-600">
-                    Annual comfort hours, overheating, and degree-hour loads for the current design.
+                    Annual comfort and temperature-stress categories (non-overlapping; totals reconcile to 8,760 h).
                   </p>
-                  <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                    <Metric label="Hours in comfort" value={`${Math.round(annualCurrent.metrics.hoursInComfort)} h`} />
-                    <Metric label="Overheating > 26°C" value={`${Math.round(annualCurrent.metrics.overheatingHours26)} h`} accent="#b91c1c" />
-                    <Metric label="Overheating > 28°C" value={`${Math.round(annualCurrent.metrics.overheatingHours28)} h`} accent="#991b1b" />
+                  <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-5">
+                    <Metric
+                      label="Hours in comfort"
+                      value={annualHourMetrics?.comfort.value ?? "0 h"}
+                      helper={annualHourMetrics?.comfort.helper}
+                    />
+                    <Metric
+                      label={`Too cold < ${COMFORT_BAND.min}°C`}
+                      value={annualHourMetrics?.tooCold.value ?? "0 h"}
+                      helper={annualHourMetrics?.tooCold.helper}
+                      accent="#1d4ed8"
+                    />
+                    <Metric
+                      label={`Warm ${COMFORT_BAND.max}-26°C`}
+                      value={annualHourMetrics?.warm23to26.value ?? "0 h"}
+                      helper={annualHourMetrics?.warm23to26.helper}
+                      accent="#ea580c"
+                    />
+                    <Metric
+                      label="Overheating 26-28°C"
+                      value={annualHourMetrics?.over26to28.value ?? "0 h"}
+                      helper={annualHourMetrics?.over26to28.helper}
+                      accent="#b91c1c"
+                    />
+                    <Metric
+                      label="Overheating > 28°C"
+                      value={annualHourMetrics?.over28.value ?? "0 h"}
+                      helper={annualHourMetrics?.over28.helper}
+                      accent="#991b1b"
+                    />
+                  </div>
+                  <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
                     <Metric
                       label="Heating degree-hours"
                       value={`${Math.round(annualCurrent.metrics.heatingDegreeHours)} Kh`}
@@ -2435,6 +2983,12 @@ export default function App() {
                       value={`${annualCurrent.metrics.peakIndoorTemp.toFixed(1)}°C`}
                       helper={formatMonthDayTime(annualCurrent.metrics.peakTime)}
                       accent="#7c2d12"
+                    />
+                    <Metric
+                      label="Minimum indoor"
+                      value={`${annualCurrent.metrics.minIndoorTemp.toFixed(1)}°C`}
+                      helper={formatMonthDayTime(annualCurrent.metrics.minTime)}
+                      accent="#1d4ed8"
                     />
                   </div>
                   <div className="grid gap-4 lg:grid-cols-2">
@@ -2864,63 +3418,6 @@ export default function App() {
                             Floor area {buildingFloorArea.toFixed(2)} m² · Volume {buildingVolume.toFixed(2)} m³
                           </div>
                         </div>
-                        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
-                          <p className="text-sm font-medium text-slate-800">Ceiling downlights (automatic)</p>
-                          <SliderField
-                            label="Brightness"
-                            value={downlightIntensity}
-                            onChange={setDownlightIntensity}
-                            min={8}
-                            max={120}
-                            step={1}
-                            formatValue={(v) => `${Math.round(v)}`}
-                          />
-                          <SliderField
-                            label="Source glow"
-                            value={downlightSourceGlow}
-                            onChange={setDownlightSourceGlow}
-                            min={0}
-                            max={4}
-                            step={0.05}
-                            formatValue={(v) => `${v.toFixed(2)}x`}
-                          />
-                          <SliderField
-                            label="Beam spread"
-                            value={downlightBeamAngle}
-                            onChange={setDownlightBeamAngle}
-                            min={0.25}
-                            max={0.95}
-                            step={0.01}
-                            formatValue={(v) => `${Math.round((v / 0.95) * 100)}%`}
-                          />
-                          <SliderField
-                            label="Edge softness"
-                            value={downlightPenumbra}
-                            onChange={setDownlightPenumbra}
-                            min={0.05}
-                            max={1}
-                            step={0.01}
-                            formatValue={(v) => `${Math.round(v * 100)}%`}
-                          />
-                          <SliderField
-                            label="Throw distance"
-                            value={downlightThrowScale}
-                            onChange={setDownlightThrowScale}
-                            min={1}
-                            max={4}
-                            step={0.05}
-                            formatValue={(v) => `${v.toFixed(2)}x room height`}
-                          />
-                          <p className="text-xs text-slate-500">
-                            Auto mode: on when desk daylight is below {LUX_THRESHOLDS.adequate} lux, from 1 hour
-                            before sunrise until {String(DOWNLIGHTS_OFF_HOUR).padStart(2, "0")}:00.
-                          </p>
-                          <p className="text-xs text-slate-600">
-                            Status now:{" "}
-                            <span className="font-semibold">{downlightsOn ? "On" : "Off"}</span> · Desk light{" "}
-                            {Math.round(snapshot.illuminanceLux ?? 0)} lux.
-                          </p>
-                        </div>
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <div className="flex items-center justify-between gap-3">
                             <div>
@@ -2988,52 +3485,6 @@ export default function App() {
                           <p className="text-xs text-slate-500">
                             Effective total WWR (area-based): {Math.round(overallWWR * 100)}%.
                           </p>
-                          <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50/60 p-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <p className="text-xs font-semibold text-slate-700">
-                                Flat rooflight (inside parapet)
-                              </p>
-                              <div className="flex items-center gap-2">
-                                <span className="text-[11px] text-slate-600">On/off</span>
-                                <Switch
-                                  checked={rooflightEnabled}
-                                  onCheckedChange={handleRooflightEnabledChange}
-                                />
-                              </div>
-                            </div>
-                            <p className="text-[11px] text-slate-600">
-                              Starts at 1.00 × 1.00 m and can only expand. Maximum size keeps at least{" "}
-                              {(ROOFLIGHT_MAX_EDGE_OFFSET_M * 1000).toFixed(0)} mm clearance to the inside parapet.
-                              {rooflightEnabled
-                                ? ` Click the rooflight in the model to open it by ${(WINDOW_OPEN_TRAVEL_M * 1000).toFixed(0)} mm.`
-                                : " Rooflight is currently off."}
-                            </p>
-                            <SliderField
-                              label="Rooflight width"
-                              value={rooflightState.width}
-                              onChange={(v) => handleRooflightSizeChange("width", v)}
-                              min={rooflightSizeLimits.minSize}
-                              max={rooflightSizeLimits.maxWidth}
-                              step={0.01}
-                              disabled={!rooflightEnabled}
-                              formatValue={(v) => `${v.toFixed(2)} m`}
-                            />
-                            <SliderField
-                              label="Rooflight depth"
-                              value={rooflightState.depth}
-                              onChange={(v) => handleRooflightSizeChange("depth", v)}
-                              min={rooflightSizeLimits.minSize}
-                              max={rooflightSizeLimits.maxDepth}
-                              step={0.01}
-                              disabled={!rooflightEnabled}
-                              formatValue={(v) => `${v.toFixed(2)} m`}
-                            />
-                            <div className="rounded-md bg-slate-100 p-2 text-xs text-slate-600">
-                              {rooflightEnabled
-                                ? `Current rooflight ${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m · opening ${Math.round(effectiveRooflightOpenHeight * 1000)} mm (${effectiveRooflightOpeningAreaM2.toFixed(2)} m² free area)`
-                                : `Rooflight is off (no opening area, no rooflight solar/heat transfer contribution).`}
-                            </div>
-                          </div>
                           <div className="space-y-3">
                             {FACES.map((face) => {
                               const config = faceState[face.id];
@@ -3119,6 +3570,157 @@ export default function App() {
                           <p className="text-xs text-slate-500">
                             Cill/head controls are per facade. Minimum clear opening kept at{" "}
                             {MIN_WINDOW_CLEAR_HEIGHT.toFixed(2)} m.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {exploreTab === "roof" && (
+                      <div className="space-y-2">
+                        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-medium text-slate-800">
+                              Flat rooflight (inside parapet)
+                            </p>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] text-slate-600">On/off</span>
+                              <Switch
+                                checked={rooflightEnabled}
+                                onCheckedChange={handleRooflightEnabledChange}
+                              />
+                            </div>
+                          </div>
+                          <p className="text-xs text-slate-600">
+                            Starts at 1.00 × 1.00 m and can only expand. Maximum size keeps at least{" "}
+                            {(ROOFLIGHT_MAX_EDGE_OFFSET_M * 1000).toFixed(0)} mm clearance to the inside parapet.
+                            {rooflightEnabled
+                              ? ` Click the rooflight in the model to open it by ${(WINDOW_OPEN_TRAVEL_M * 1000).toFixed(0)} mm.`
+                              : " Rooflight is currently off."}
+                          </p>
+                          <SliderField
+                            label="Rooflight width"
+                            value={rooflightState.width}
+                            onChange={(v) => handleRooflightSizeChange("width", v)}
+                            min={rooflightSizeLimits.minSize}
+                            max={rooflightSizeLimits.maxWidth}
+                            step={0.01}
+                            disabled={!rooflightEnabled}
+                            formatValue={(v) => `${v.toFixed(2)} m`}
+                          />
+                          <SliderField
+                            label="Rooflight depth"
+                            value={rooflightState.depth}
+                            onChange={(v) => handleRooflightSizeChange("depth", v)}
+                            min={rooflightSizeLimits.minSize}
+                            max={rooflightSizeLimits.maxDepth}
+                            step={0.01}
+                            disabled={!rooflightEnabled}
+                            formatValue={(v) => `${v.toFixed(2)} m`}
+                          />
+                          <div className="rounded-md bg-slate-100 p-2 text-xs text-slate-600">
+                            {rooflightEnabled
+                              ? `Current rooflight ${rooflightSpec.width.toFixed(2)} × ${rooflightSpec.depth.toFixed(2)} m · opening ${Math.round(effectiveRooflightOpenHeight * 1000)} mm (${effectiveRooflightOpeningAreaM2.toFixed(2)} m² free area)`
+                              : "Rooflight is off (no opening area, no rooflight solar/heat transfer contribution)."}
+                          </div>
+                        </div>
+
+                        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-slate-800">Rooftop solar PV</p>
+                              <p className="text-xs text-slate-500">
+                                Uses standard module sizes only (no partial/tiny filler panels). Current module:{" "}
+                                {activeSolarPanelPreset.label} ({activeSolarPanelPreset.depthM.toFixed(2)} ×{" "}
+                                {activeSolarPanelPreset.widthM.toFixed(2)} m, ~
+                                {Math.round(activeSolarPanelPreset.powerKW * 1000)} W each). Keeps{" "}
+                                {(ROOF_PV_CLEARANCE_M * 1000).toFixed(0)} mm edge and rooflight clearance.
+                              </p>
+                            </div>
+                            <Switch
+                              checked={solarPvEnabled}
+                              onCheckedChange={handleSolarPvEnabledChange}
+                            />
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            {Object.values(SOLAR_PANEL_PRESETS).map((preset) => (
+                              <Button
+                                key={preset.id}
+                                size="sm"
+                                variant={solarPvPanelPreset === preset.id ? "default" : "secondary"}
+                                className="justify-start"
+                                onClick={() => handleSolarPvPanelPresetChange(preset.id)}
+                                disabled={!solarPvEnabled}
+                              >
+                                {preset.label}
+                              </Button>
+                            ))}
+                          </div>
+                          <SliderField
+                            label="Coverage target (whole panels)"
+                            value={solarPvCoverage}
+                            onChange={setSolarPvCoverage}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            disabled={!solarPvEnabled}
+                            formatValue={(v) => `${Math.round(v * 100)}%`}
+                          />
+                          <SliderField
+                            label="Panel pitch"
+                            value={solarPvPitchDeg}
+                            onChange={setSolarPvPitchDeg}
+                            min={0}
+                            max={45}
+                            step={1}
+                            disabled={!solarPvEnabled}
+                            formatValue={(v) => `${Math.round(v)}°`}
+                          />
+                          <p className="text-[11px] text-slate-500">
+                            Pitch defaults to a latitude-based annual optimum for the selected location, and affects
+                            both 3D panel angle and PV yield via tilted-plane irradiance.
+                          </p>
+                          <SliderField
+                            label="Panel efficiency"
+                            value={solarPvEfficiency}
+                            onChange={setSolarPvEfficiency}
+                            min={0.1}
+                            max={0.3}
+                            step={0.005}
+                            disabled={!solarPvEnabled}
+                            formatValue={(v) => `${(v * 100).toFixed(1)}%`}
+                          />
+                          <SliderField
+                            label="Performance ratio"
+                            value={solarPvPerformanceRatio}
+                            onChange={setSolarPvPerformanceRatio}
+                            min={0.5}
+                            max={0.95}
+                            step={0.01}
+                            disabled={!solarPvEnabled}
+                            formatValue={(v) => `${Math.round(v * 100)}%`}
+                          />
+                          <div className="rounded-md bg-slate-50 p-2 text-xs text-slate-600">
+                            PV-eligible roof area {availableRoofAreaForPvM2.toFixed(2)} m² · Max fit{" "}
+                            {maxInstallablePvPanelCount} standard panels ({maxInstallablePvAreaM2.toFixed(2)} m²).
+                            Installed: {installedPvPanelCount} panels ({installedPvAreaM2.toFixed(2)} m², ~
+                            {(installedPvPanelCount * activeSolarPanelPreset.powerKW).toFixed(1)} kWp).
+                          </div>
+                          <div className="rounded-md bg-slate-50 p-2 text-xs text-slate-600">
+                            Estimated PV yield: {daySolarPvGenerationKWh.toFixed(1)} kWh on selected day ·{" "}
+                            {(annualCostSummary?.onSiteSolarKWh ?? 0).toFixed(0)} kWh/year.
+                          </div>
+                          <p
+                            className={`text-xs ${
+                              annualOperationalCarbonNetZero ? "text-emerald-700" : "text-slate-500"
+                            }`}
+                          >
+                            {annualOperationalCarbonNetZero
+                              ? "Modeled HVAC operational carbon is net-zero over the year."
+                              : `Modeled HVAC operational carbon still has ${(annualCostSummary?.carbonKg ?? 0).toFixed(1)} kg CO2e/year remaining.`}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            This model currently heats with gas, so PV mostly offsets cooling electricity. Reaching
+                            zero operational carbon typically also needs electrified heating.
                           </p>
                         </div>
                       </div>
@@ -3236,6 +3838,20 @@ export default function App() {
                               {hasManualOpenings ? ` + ${openedWindowAch.toFixed(1)} from manual openings` : ""}).
                             </p>
                           )}
+                          {mvhrControlAvailable && (
+                            <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3">
+                              <div>
+                                <p className="text-sm font-medium text-slate-800">MVHR auto control</p>
+                                <p className="text-xs text-slate-500">
+                                  Simulates base flow, occupied-period boost, and summer bypass.
+                                </p>
+                              </div>
+                              <Switch
+                                checked={mvhrAutoControlEnabled}
+                                onCheckedChange={handleMvhrAutoControlChange}
+                              />
+                            </div>
+                          )}
                           <p className="text-xs text-slate-500">
                             {ventilationComfortSummary}
                           </p>
@@ -3253,19 +3869,21 @@ export default function App() {
                               : "Rooflight: OFF."}
                           </p>
                         </div>
-                        <div className={`flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3 ${adaptiveVentEnabled ? "opacity-50" : ""}`}>
+                        <div className={`flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3 ${adaptiveVentEnabled || (mvhrControlAvailable && mvhrAutoControlEnabled) ? "opacity-50" : ""}`}>
                           <div>
                             <p className="text-sm font-medium text-slate-800">Night purge</p>
                             <p className="text-xs text-slate-500">
                               {adaptiveVentEnabled
                                 ? "Adaptive mode handles night cooling automatically."
+                                : mvhrControlAvailable && mvhrAutoControlEnabled
+                                  ? "MVHR auto control is active, so night purge is disabled."
                                 : `Boost to ${VENTILATION_PRESETS.purge.achTotal.toFixed(1)} air changes per hour between ${String(NIGHT_START_HOUR).padStart(2, "0")}:00-${String(NIGHT_END_HOUR).padStart(2, "0")}:00.`}
                             </p>
                           </div>
                           <Switch
-                            checked={adaptiveVentEnabled || nightPurgeEnabled}
+                            checked={nightPurgeEnabled}
                             onCheckedChange={handleNightPurgeChange}
-                            disabled={adaptiveVentEnabled}
+                            disabled={adaptiveVentEnabled || (mvhrControlAvailable && mvhrAutoControlEnabled)}
                           />
                         </div>
                         <div className="rounded-lg border border-slate-200 bg-white p-3">
@@ -3319,7 +3937,8 @@ export default function App() {
                               <span className="font-medium text-slate-700">{passivhausVentPreset?.label ?? "MVHR"}</span>{" "}
                               at {passivhausVentPreset?.achTotal?.toFixed?.(1) ?? "n/a"} ACH.
                             </li>
-                            <li>Night purge on (adds overnight cooling support from 22:00-06:00).</li>
+                            <li>MVHR auto control on (base flow + boost + summer bypass).</li>
+                            <li>Night purge off by default (turn on only for summer stress-testing).</li>
                             <li>
                               Facade defaults: smaller N/E/W glazing, larger south glazing, plus south overhang and
                               E/W fins to temper summer solar gains.

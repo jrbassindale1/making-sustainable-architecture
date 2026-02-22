@@ -1,6 +1,6 @@
 # Room Comfort Simulator Assumptions
 
-Last updated: February 19, 2026.
+Last updated: February 20, 2026.
 
 ## 1) Scope and intended use
 
@@ -124,6 +124,7 @@ Optional night purge:
 - Spin-up period before reporting a day: `7 days` by default (adjustable via "Balanced out").
 - Start indoor temperature: auto (matches outdoor at spin-up start).
 - Annual reporting run: `8760` hourly steps (typical year view).
+- Annual simulation always uses adaptive ventilation (occupants naturally open windows when beneficial for cooling), regardless of daily view preset selection. This reflects realistic occupant behaviour over a full year.
 - Passivhaus override (indicative): one-click preset for Passivhaus-style design comparison:
   - Applies Passivhaus fabric and MVHR ventilation presets (see above).
   - Enables night purge (`22:00-06:00` at `6.0 ACH`). Note: heat recovery is disabled during night purge hours as this represents window-based ventilation, not MVHR bypass.
@@ -173,12 +174,22 @@ Core formulas (per timestep):
 ```
 Heating fuel kWh = Heating thermal kWh / boiler_efficiency
 Cooling electric kWh = Cooling thermal kWh / COP
+Base electrical kWh = (lighting + small_power + MVHR_fans) * hours
+Total electricity demand kWh = Cooling electric kWh + Base electrical kWh
 
-Cost (£) = (heating_fuel_kWh * gas_rate) + (cooling_elec_kWh * elec_rate)
-         + standing_charges
+Solar used on-site kWh = min(total_elec_demand_kWh, solar_generated_kWh)
+Solar exported kWh = max(0, solar_generated_kWh - total_elec_demand_kWh)
+Grid electricity kWh = max(0, total_elec_demand_kWh - solar_used_onsite_kWh)
 
-Carbon (kg CO2e) = (heating_fuel_kWh * gas_factor) + (cooling_elec_kWh * elec_factor)
+Cost (£) = (heating_fuel_kWh * gas_rate) + (grid_elec_kWh * elec_rate)
+         - (solar_exported_kWh * export_rate) + standing_charges
+
+Gross carbon (kg CO2e) = (heating_fuel_kWh * gas_factor) + (grid_elec_kWh * elec_factor)
+Displaced carbon (kg CO2e) = solar_exported_kWh * elec_factor
+Net carbon (kg CO2e) = Gross carbon - Displaced carbon
 ```
+
+**Net zero operational carbon** is achieved when exported PV displaces enough grid carbon to offset HVAC emissions. With gas heating, this requires significant PV export to offset the `0.20268 kg/kWh` gas carbon factor.
 
 Default system assumptions:
 
@@ -186,17 +197,53 @@ Default system assumptions:
 - Cooling: electric DX cooling, COP `3.0`.
 - Standing charges: included in all £ figures.
 
+Base electrical loads (included in total electricity demand):
+
+- **Lighting**: `8 W/m²` for `6 hours/day` average (efficient LED, varies by season).
+- **Small power (plugs)**: `5 W/m²` for `8 hours/day` average.
+- **MVHR fans**: `15 W` continuous (`24 hours/day`).
+
+These loads are offset by PV before any surplus is exported, making zero carbon more realistic to achieve.
+
 Tariffs (Ofgem price cap, **1 January 2026 to 31 March 2026**, typical Direct Debit):
 
-- Electricity: `27.69 p/kWh` + `54.75 p/day` standing charge.
+- Electricity import: `27.69 p/kWh` + `54.75 p/day` standing charge.
+- Electricity export (SEG): `15.0 p/kWh` (Smart Export Guarantee, typical rate).
 - Gas: `5.93 p/kWh` + `35.09 p/day` standing charge.
 
 Carbon factors (UK Government GHG Conversion Factors 2025, kg CO2e per kWh):
 
 - Electricity consumption: `0.19553` (generation `0.177` + T&D `0.01853`).
 - Natural gas: `0.20268` (derived from `2575.46441 kg CO2e/tonne` and net CV `12.707 kWh/kg`).
+- Exported PV displaces grid electricity at the consumption factor (`0.19553 kg/kWh`).
 
 Carbon is reported in **kg CO2e**.
+
+**LETI Net Zero Operational Carbon targets** (kgCO₂e/m²/year):
+
+The model reports carbon intensity aligned with LETI Climate Emergency Design Guide (2020) metrics:
+
+- Residential: ≤`35` kgCO₂e/m²/year
+- Office: ≤`55` kgCO₂e/m²/year
+- Retail: ≤`50` kgCO₂e/m²/year
+- Hotel: ≤`55` kgCO₂e/m²/year
+
+Default comparison uses the Residential target. Carbon intensity is calculated as net annual carbon (gross emissions minus displaced carbon from PV export) divided by floor area.
+
+**What this model includes:**
+- Heating (gas boiler)
+- Cooling (electric)
+- Lighting
+- Small power (plug loads)
+- MVHR fans
+
+**What this model excludes:**
+- Embodied carbon (materials, construction)
+- Domestic hot water
+- Cooking
+- Lifts/escalators
+- External lighting
+- Refrigerant leakage
 
 ## 6) Credibility and calibration notes
 

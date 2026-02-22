@@ -130,6 +130,15 @@ export const ADAPTIVE_VENTILATION_CONFIG = {
   overheatScaleMax: 3,
   achRange: { min: 0.6, max: 6.0 },
 };
+export const MVHR_CONTROL_CONFIG = {
+  boostAch: 0.8,
+  summerBoostAch: 1.2,
+  occupiedMorningStartHour: 6,
+  occupiedMorningEndHour: 9,
+  occupiedEveningStartHour: 17,
+  occupiedEveningEndHour: 22,
+  bypassBenefitDeltaC: 0.5,
+};
 
 /* -------------------- Energy cost + carbon assumptions -------------------- */
 export const HEATING_SYSTEM = {
@@ -142,11 +151,33 @@ export const COOLING_SYSTEM = {
   fuel: "electricity",
   cop: 3.0,
 };
+
+// Base electrical loads (lighting, small power, ventilation fans)
+// These run regardless of heating/cooling and must be offset for true zero carbon
+export const BASE_ELECTRICAL_LOADS = {
+  lighting: {
+    label: "LED lighting",
+    powerDensityWm2: 8, // W/m² when on (efficient LED)
+    dailyHours: 6, // Average hours per day (varies by season, simplified)
+  },
+  smallPower: {
+    label: "Small power (plugs)",
+    powerDensityWm2: 5, // W/m² average when occupied
+    dailyHours: 8, // Hours per day
+  },
+  mvhrFans: {
+    label: "MVHR fans",
+    powerW: 15, // Continuous fan power for small unit (W)
+    dailyHours: 24, // Runs continuously
+  },
+};
+
 export const PRICE_CAP_PERIOD_LABEL = "1 Jan-31 Mar 2026";
 export const ENERGY_TARIFFS = {
   electricity: {
     unitRate: 0.2769,
     standingChargePerDay: 0.5475,
+    exportRate: 0.15, // Smart Export Guarantee (SEG) typical rate
   },
   gas: {
     unitRate: 0.0593,
@@ -166,6 +197,28 @@ export const CARBON_FACTORS = {
   },
 };
 export const INCLUDE_STANDING_CHARGES = true;
+
+// LETI Net Zero Operational Carbon targets (kgCO₂e/m²/year)
+// Source: LETI Climate Emergency Design Guide (2020)
+export const LETI_TARGETS = {
+  residential: {
+    label: "Residential",
+    target: 35, // kgCO₂e/m²/year
+  },
+  office: {
+    label: "Office",
+    target: 55, // kgCO₂e/m²/year
+  },
+  retail: {
+    label: "Retail",
+    target: 50, // kgCO₂e/m²/year
+  },
+  hotel: {
+    label: "Hotel",
+    target: 55, // kgCO₂e/m²/year
+  },
+};
+export const DEFAULT_LETI_TARGET = "residential";
 
 /* -------------------- Daylight / Illuminance -------------------- */
 // Luminous efficacy: converts solar irradiance (W/m²) to illuminance (lux)
@@ -696,32 +749,94 @@ export function safeRadiation(value) {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-export function computeCostCarbonSummary({ heatingThermalKWh, coolingThermalKWh, days = 1 }) {
+export function computeCostCarbonSummary({
+  heatingThermalKWh,
+  coolingThermalKWh,
+  days = 1,
+  onSiteSolarKWh = 0,
+  floorAreaM2 = BUILDING_WIDTH * BUILDING_DEPTH,
+}) {
   const safeHeating = Number.isFinite(heatingThermalKWh) ? heatingThermalKWh : 0;
   const safeCooling = Number.isFinite(coolingThermalKWh) ? coolingThermalKWh : 0;
+  const safeSolar = Math.max(0, Number.isFinite(onSiteSolarKWh) ? onSiteSolarKWh : 0);
+  const safeFloorArea = Math.max(1, Number.isFinite(floorAreaM2) ? floorAreaM2 : BUILDING_WIDTH * BUILDING_DEPTH);
+
+  // HVAC fuel consumption
   const heatingFuelKWh = safeHeating / Math.max(0.01, HEATING_SYSTEM.efficiency);
   const coolingFuelKWh = safeCooling / Math.max(0.01, COOLING_SYSTEM.cop);
-  const energyCost =
+
+  // Base electrical loads (lighting, small power, MVHR fans)
+  const lightingKWh =
+    (BASE_ELECTRICAL_LOADS.lighting.powerDensityWm2 * safeFloorArea *
+      BASE_ELECTRICAL_LOADS.lighting.dailyHours * days) / 1000;
+  const smallPowerKWh =
+    (BASE_ELECTRICAL_LOADS.smallPower.powerDensityWm2 * safeFloorArea *
+      BASE_ELECTRICAL_LOADS.smallPower.dailyHours * days) / 1000;
+  const mvhrFansKWh =
+    (BASE_ELECTRICAL_LOADS.mvhrFans.powerW *
+      BASE_ELECTRICAL_LOADS.mvhrFans.dailyHours * days) / 1000;
+  const baseElectricalKWh = lightingKWh + smallPowerKWh + mvhrFansKWh;
+
+  // Total electricity demand (cooling + base electrical)
+  const totalElectricityDemandKWh = coolingFuelKWh + baseElectricalKWh;
+
+  // PV offsets on-site consumption first, then exports surplus
+  const solarUsedOnSiteKWh = Math.min(totalElectricityDemandKWh, safeSolar);
+  const solarExportedKWh = Math.max(0, safeSolar - totalElectricityDemandKWh);
+  const gridElectricityKWh = Math.max(0, totalElectricityDemandKWh - solarUsedOnSiteKWh);
+
+  // Energy costs
+  const energyCostGross =
     heatingFuelKWh * ENERGY_TARIFFS.gas.unitRate +
-    coolingFuelKWh * ENERGY_TARIFFS.electricity.unitRate;
+    gridElectricityKWh * ENERGY_TARIFFS.electricity.unitRate;
+  const exportRevenue = solarExportedKWh * ENERGY_TARIFFS.electricity.exportRate;
+  const energyCost = energyCostGross - exportRevenue;
   const standingCost = INCLUDE_STANDING_CHARGES
     ? days *
       (ENERGY_TARIFFS.gas.standingChargePerDay +
         ENERGY_TARIFFS.electricity.standingChargePerDay)
     : 0;
   const totalCost = energyCost + standingCost;
-  const carbonKg =
+
+  // Carbon accounting
+  const grossCarbonKg =
     heatingFuelKWh * CARBON_FACTORS.gas.perKWh +
-    coolingFuelKWh * CARBON_FACTORS.electricity.consumption;
+    gridElectricityKWh * CARBON_FACTORS.electricity.consumption;
+  // Exported solar displaces grid electricity carbon
+  const displacedCarbonKg = solarExportedKWh * CARBON_FACTORS.electricity.consumption;
+  const carbonKg = grossCarbonKg - displacedCarbonKg;
+
+  // Carbon intensity (kgCO₂e/m²/year) - LETI metric
+  // For daily figures, annualize by multiplying by 365/days
+  const annualizationFactor = 365 / Math.max(1, days);
+  const carbonIntensityKgM2Year = (carbonKg * annualizationFactor) / safeFloorArea;
+  const grossCarbonIntensityKgM2Year = (grossCarbonKg * annualizationFactor) / safeFloorArea;
+
   return {
     heatingThermalKWh: safeHeating,
     coolingThermalKWh: safeCooling,
     heatingFuelKWh,
     coolingFuelKWh,
+    baseElectricalKWh,
+    lightingKWh,
+    smallPowerKWh,
+    mvhrFansKWh,
+    totalElectricityDemandKWh,
+    onSiteSolarKWh: safeSolar,
+    solarUsedOnSiteKWh,
+    solarExportedKWh,
+    gridElectricityKWh,
+    energyCostGross,
+    exportRevenue,
     energyCost,
     standingCost,
     totalCost,
+    grossCarbonKg,
+    displacedCarbonKg,
     carbonKg,
+    carbonIntensityKgM2Year,
+    grossCarbonIntensityKgM2Year,
+    floorAreaM2: safeFloorArea,
   };
 }
 
@@ -916,6 +1031,57 @@ export function adaptiveVentilationStateForStep({
   const ventActive = achWindow > 0;
 
   return { ventActive, achWindow, achTotal: safeTotal, adaptiveReason };
+}
+
+function isHourInRange(hourOfDay, startHour, endHour) {
+  const hour = ((Math.floor(hourOfDay) % 24) + 24) % 24;
+  const start = ((Math.floor(startHour) % 24) + 24) % 24;
+  const end = ((Math.floor(endHour) % 24) + 24) % 24;
+  if (start === end) return true;
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end;
+}
+
+export function mvhrVentilationStateForStep({
+  indoorTemp,
+  outdoorTemp,
+  hourOfDay = 12,
+  baseAch = VENTILATION_PRESETS.passivhaus?.achTotal ?? 0.4,
+  comfortBand = COMFORT_BAND,
+  config = MVHR_CONTROL_CONFIG,
+}) {
+  const safeBase = Math.max(ACH_INFILTRATION_DEFAULT, Number.isFinite(baseAch) ? baseAch : ACH_INFILTRATION_DEFAULT);
+  const occupiedMorning = isHourInRange(
+    hourOfDay,
+    config.occupiedMorningStartHour,
+    config.occupiedMorningEndHour,
+  );
+  const occupiedEvening = isHourInRange(
+    hourOfDay,
+    config.occupiedEveningStartHour,
+    config.occupiedEveningEndHour,
+  );
+  const occupiedPeriod = occupiedMorning || occupiedEvening;
+  const coolingNeeded = indoorTemp > comfortBand.max;
+  const outdoorCanCool = outdoorTemp <= indoorTemp - config.bypassBenefitDeltaC;
+  const mvhrBypassActive = coolingNeeded && outdoorCanCool;
+
+  let targetAch = safeBase;
+  let mvhrMode = "base";
+
+  if (mvhrBypassActive) {
+    targetAch = Math.max(safeBase, config.summerBoostAch);
+    mvhrMode = "summer-bypass";
+  } else if (occupiedPeriod) {
+    targetAch = Math.max(safeBase, config.boostAch);
+    mvhrMode = "boost";
+  }
+
+  const achTotal = Math.max(ACH_INFILTRATION_DEFAULT, targetAch);
+  const achWindow = Math.max(0, achTotal - ACH_INFILTRATION_DEFAULT);
+  const ventActive = achWindow > 0;
+
+  return { ventActive, achWindow, achTotal, mvhrMode, mvhrBypassActive };
 }
 
 export function validateEpwDataset(dataset) {
@@ -1461,6 +1627,31 @@ export function planeIrradianceHorizontalUp({
   return { I_beam, I_diff, I_gnd };
 }
 
+export function planeIrradianceTilted({
+  tiltDeg = 0,
+  surfaceAzimuthDeg = 180,
+  altitudeDeg,
+  azimuthDeg,
+  DNI,
+  DHI,
+  GHI,
+  groundAlbedo = 0.2,
+}) {
+  const beta = deg2rad(Math.max(0, Math.min(90, Number.isFinite(tiltDeg) ? tiltDeg : 0)));
+  const alt = deg2rad(Number.isFinite(altitudeDeg) ? altitudeDeg : 0);
+  const azDiff = deg2rad(
+    Math.abs(((Number(azimuthDeg) - Number(surfaceAzimuthDeg) + 540) % 360) - 180),
+  );
+  const cosTheta =
+    Math.sin(alt) * Math.cos(beta) +
+    Math.cos(alt) * Math.sin(beta) * Math.cos(azDiff);
+  const I_beam = Math.max(0, Number(DNI) || 0) * Math.max(0, cosTheta);
+  const I_diff = Math.max(0, Number(DHI) || 0) * ((1 + Math.cos(beta)) / 2);
+  const I_gnd =
+    Math.max(0, Number(GHI) || 0) * Math.max(0, Number(groundAlbedo) || 0) * ((1 - Math.cos(beta)) / 2);
+  return { I_beam, I_diff, I_gnd };
+}
+
 /* -------------------- Thermal engine -------------------- */
 export function computeSnapshot(params) {
   const {
@@ -1681,6 +1872,11 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
   const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
   const adaptiveVentEnabled = options.adaptiveVentEnabled ?? false;
+  const mvhrControlEnabled = options.mvhrControlEnabled ?? false;
+  const mvhrControlActive =
+    mvhrControlEnabled &&
+    !adaptiveVentEnabled &&
+    heatRecoveryEfficiencyPreset > 0;
   const startIndoorTemp = options.startIndoorTemp;
   const dtSeconds = stepMinutes * 60;
   const stepsPerDay = Math.round((24 * 60) / stepMinutes);
@@ -1699,6 +1895,14 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
           hourOfDay,
           comfortBand,
         })
+      : mvhrControlActive
+        ? mvhrVentilationStateForStep({
+            indoorTemp,
+            outdoorTemp: forcing.T_out,
+            hourOfDay,
+            baseAch: achTotalPreset,
+            comfortBand,
+          })
       : ventilationStateForStep({
           achTotal: achTotalPreset,
           hourOfDay,
@@ -1740,9 +1944,15 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
 
     // Heat recovery only applies to mechanical ventilation, not window-based ventilation
     // Disable HR when: adaptive mode, manual windows open, or night purge active
-    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const isNightPurgeActive =
+      !mvhrControlActive &&
+      nightPurgeEnabled &&
+      (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
     const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
-    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+    const effectiveHeatRecovery =
+      hasWindowVentilation || baseVent.mvhrBypassActive
+        ? 0
+        : heatRecoveryEfficiencyPreset;
 
     const snapshot = computeSnapshot({
       ...params,
@@ -1759,7 +1969,7 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
     const UA_total = snapshot.UA_out + snapshot.UA_vent;
     const Q_passive = snapshot.Q_solar + params.Q_internal;
     const dTdt = (Q_passive - UA_total * (indoorTemp - forcing.T_out)) / thermalCapacitance;
-    return { snapshot, forcing, UA_total, Q_passive, dTdt, vent };
+    return { snapshot, forcing, UA_total, Q_passive, dTdt, vent, effectiveHeatRecovery };
   };
 
   let indoorTemp = Number.isFinite(startIndoorTemp)
@@ -1791,6 +2001,11 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       timeLabel: formatClockTime(t),
       T_in: indoorTemp,
       T_out: step.forcing.T_out,
+      DNI: step.forcing.DNI,
+      DHI: step.forcing.DHI,
+      GHI: step.forcing.GHI,
+      solarAltitudeDeg: step.snapshot.altitude,
+      solarAzimuthDeg: step.snapshot.azimuth,
       Q_solar: step.snapshot.Q_solar,
       Q_loss_fabric: step.snapshot.Q_loss_fabric,
       Q_loss_vent: step.snapshot.Q_loss_vent,
@@ -1805,6 +2020,9 @@ export function simulateDay1R1C(params, baseDateLocal, weatherProvider, options 
       manualOpenAch: step.vent.manualOpenAch,
       manualVentilationMode: step.vent.manualVentilation?.mode,
       adaptiveReason: step.vent.adaptiveReason,
+      mvhrMode: step.vent.mvhrMode,
+      mvhrBypassActive: step.vent.mvhrBypassActive === true,
+      effectiveHeatRecovery: step.effectiveHeatRecovery,
       illuminanceLux: step.snapshot.illuminanceLux,
     });
 
@@ -1824,7 +2042,20 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
   const manualVentilationInput = options.manualVentilationInput ?? null;
   const nightPurgeEnabled = options.nightPurgeEnabled ?? false;
   const adaptiveVentEnabled = options.adaptiveVentEnabled ?? false;
+  const mvhrControlEnabled = options.mvhrControlEnabled ?? false;
+  const mvhrControlActive =
+    mvhrControlEnabled &&
+    !adaptiveVentEnabled &&
+    heatRecoveryEfficiencyPreset > 0;
   const spinupHours = options.spinupHours ?? 7 * 24;
+  const pvModel = options.pvModel ?? null;
+  const pvTiltDeg = Number.isFinite(pvModel?.tiltDeg) ? Math.max(0, pvModel.tiltDeg) : 0;
+  const pvSurfaceAzimuthDeg = Number.isFinite(pvModel?.surfaceAzimuthDeg)
+    ? pvModel.surfaceAzimuthDeg
+    : 180;
+  const pvGroundAlbedo = Number.isFinite(pvModel?.groundAlbedo)
+    ? Math.max(0, pvModel.groundAlbedo)
+    : 0.2;
   const startIndoorTemp = options.startIndoorTemp;
   const dtSeconds = 3600;
   const totalHours = 8760;
@@ -1840,6 +2071,14 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
           hourOfDay: time.getUTCHours(),
           comfortBand,
         })
+      : mvhrControlActive
+        ? mvhrVentilationStateForStep({
+            indoorTemp,
+            outdoorTemp: forcing.T_out,
+            hourOfDay: time.getUTCHours(),
+            baseAch: achTotalPreset,
+            comfortBand,
+          })
       : ventilationStateForStep({
           achTotal: achTotalPreset,
           hourOfDay: time.getUTCHours(),
@@ -1875,9 +2114,15 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
 
     // Heat recovery only applies to mechanical ventilation, not window-based ventilation
     const hourOfDay = time.getUTCHours();
-    const isNightPurgeActive = nightPurgeEnabled && (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
+    const isNightPurgeActive =
+      !mvhrControlActive &&
+      nightPurgeEnabled &&
+      (hourOfDay >= NIGHT_START_HOUR || hourOfDay < NIGHT_END_HOUR);
     const hasWindowVentilation = adaptiveVentEnabled || manualOpenAch > 0 || isNightPurgeActive;
-    const effectiveHeatRecovery = hasWindowVentilation ? 0 : heatRecoveryEfficiencyPreset;
+    const effectiveHeatRecovery =
+      hasWindowVentilation || baseVent.mvhrBypassActive
+        ? 0
+        : heatRecoveryEfficiencyPreset;
 
     const snapshot = computeSnapshot({
       ...params,
@@ -1916,12 +2161,17 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
     hoursInComfort: 0,
     overheatingHours26: 0,
     overheatingHours28: 0,
+    tooColdHours: 0,
     heatingDegreeHours: 0,
     coolingDegreeHours: 0,
     heatingEnergyKWh: 0,
     coolingEnergyKWh: 0,
+    globalHorizontalIrradianceKWhM2: 0,
+    tiltedPlaneIrradianceKWhM2: 0,
     peakIndoorTemp: -Infinity,
     peakTime: dateFromTypicalYearHour(0),
+    minIndoorTemp: Infinity,
+    minTime: dateFromTypicalYearHour(0),
   };
 
   for (let hour = 0; hour < totalHours; hour++) {
@@ -1936,8 +2186,22 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
     const qHvacSteady = step.UA_total * (setpointTemp - step.forcing.T_out) - step.Q_passive;
     const heatingW = status === "heating" ? Math.max(0, qHvacSteady) : 0;
     const coolingW = status === "cooling" ? Math.max(0, -qHvacSteady) : 0;
+    const ghiWm2 = Number.isFinite(step.forcing.GHI) ? Math.max(0, step.forcing.GHI) : 0;
+    const { I_beam: pvBeam, I_diff: pvDiff, I_gnd: pvGnd } = planeIrradianceTilted({
+      tiltDeg: pvTiltDeg,
+      surfaceAzimuthDeg: pvSurfaceAzimuthDeg,
+      altitudeDeg: step.snapshot.altitude,
+      azimuthDeg: step.snapshot.azimuth,
+      DNI: step.forcing.DNI,
+      DHI: step.forcing.DHI,
+      GHI: step.forcing.GHI,
+      groundAlbedo: pvGroundAlbedo,
+    });
+    const pvPlaneWm2 = pvBeam + pvDiff + pvGnd;
     metrics.heatingEnergyKWh += heatingW / 1000;
     metrics.coolingEnergyKWh += coolingW / 1000;
+    metrics.globalHorizontalIrradianceKWhM2 += ghiWm2 / 1000;
+    metrics.tiltedPlaneIrradianceKWhM2 += pvPlaneWm2 / 1000;
     const over26 = indoorTemp > 26;
     const over28 = indoorTemp > 28;
     const month = date.getUTCMonth();
@@ -1946,11 +2210,16 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
     if (status === "comfortable") metrics.hoursInComfort += 1;
     if (over26) metrics.overheatingHours26 += 1;
     if (over28) metrics.overheatingHours28 += 1;
+    if (indoorTemp < comfortBand.min) metrics.tooColdHours += 1;
     metrics.heatingDegreeHours += Math.max(0, comfortBand.min - indoorTemp);
     metrics.coolingDegreeHours += Math.max(0, indoorTemp - comfortBand.max);
     if (indoorTemp > metrics.peakIndoorTemp) {
       metrics.peakIndoorTemp = indoorTemp;
       metrics.peakTime = date;
+    }
+    if (indoorTemp < metrics.minIndoorTemp) {
+      metrics.minIndoorTemp = indoorTemp;
+      metrics.minTime = date;
     }
 
     if (over26) monthly[month].over26 += 1;
@@ -1966,6 +2235,7 @@ export function simulateAnnual1R1C(params, weatherProvider, options = {}) {
       dateLabel: formatMonthDayTime(date),
       T_in: indoorTemp,
       T_out: step.forcing.T_out,
+      GHI: step.forcing.GHI,
       Q_solar: step.snapshot.Q_solar,
       ventOn: step.vent.ventActive ? 1 : 0,
       achTotal: step.vent.achTotal,

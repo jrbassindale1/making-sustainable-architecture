@@ -37,16 +37,23 @@ export function inferClimatologyFromLocation(location = {}) {
     : estimateTimezoneFromLongitude(longitude);
 
   const absLat = Math.abs(latitude);
+  const latNormalized = absLat / 90;
   // Adds modest variation by longitude so places on the same latitude are not identical.
   const continentality = Math.abs(Math.sin(deg2rad(longitude * 1.2 + latitude * 0.35)));
   const maritime = 1 - continentality;
 
-  const annualMeanSeaLevel = 28 - absLat * 0.42;
-  const elevationCooling = elevationM * 0.0065;
+  // Keep tropical/subtropical highland climates from being unrealistically cold.
+  const annualMeanSeaLevel = 27 - absLat * 0.08 - absLat * absLat * 0.0042;
+  const elevationLapseRate = 0.0018 + latNormalized * 0.0044;
+  const elevationCooling = elevationM * elevationLapseRate;
   const annualMean = annualMeanSeaLevel - elevationCooling;
 
-  const seasonalRange = clamp(4 + absLat * (0.25 + continentality * 0.16), 3, 26);
-  const diurnalRange = clamp(5 + absLat * 0.045 + continentality * 3.4 + (elevationM / 1000) * 1.1, 4, 18);
+  const seasonalRange = clamp(2 + absLat * (0.1 + continentality * 0.08), 2, 22);
+  const diurnalRange = clamp(
+    4.5 + absLat * 0.03 + continentality * 2 + (elevationM / 1000) * 0.8,
+    3,
+    16,
+  );
   const summer = annualMean + seasonalRange / 2;
   const winter = annualMean - seasonalRange / 2;
 
