@@ -704,28 +704,41 @@ export function safeRadiation(value) {
 export function computeCostCarbonSummary({ heatingThermalKWh, coolingThermalKWh, days = 1 }) {
   const safeHeating = Number.isFinite(heatingThermalKWh) ? heatingThermalKWh : 0;
   const safeCooling = Number.isFinite(coolingThermalKWh) ? coolingThermalKWh : 0;
-  const heatingFuelKWh = safeHeating / Math.max(0.01, HEATING_SYSTEM.efficiency);
-  const coolingFuelKWh = safeCooling / Math.max(0.01, COOLING_SYSTEM.cop);
-  const energyCost =
-    heatingFuelKWh * ENERGY_TARIFFS.gas.unitRate +
-    coolingFuelKWh * ENERGY_TARIFFS.electricity.unitRate;
+  const gasUseKWh = safeHeating / Math.max(0.01, HEATING_SYSTEM.efficiency);
+  const electricityUseKWh = safeCooling / Math.max(0.01, COOLING_SYSTEM.cop);
+  const gasEnergyCost = gasUseKWh * ENERGY_TARIFFS.gas.unitRate;
+  const electricityEnergyCost = electricityUseKWh * ENERGY_TARIFFS.electricity.unitRate;
+  const energyCost = gasEnergyCost + electricityEnergyCost;
+  const gasStandingCost = INCLUDE_STANDING_CHARGES
+    ? days * ENERGY_TARIFFS.gas.standingChargePerDay
+    : 0;
+  const electricityStandingCost = INCLUDE_STANDING_CHARGES
+    ? days * ENERGY_TARIFFS.electricity.standingChargePerDay
+    : 0;
   const standingCost = INCLUDE_STANDING_CHARGES
-    ? days *
-      (ENERGY_TARIFFS.gas.standingChargePerDay +
-        ENERGY_TARIFFS.electricity.standingChargePerDay)
+    ? gasStandingCost + electricityStandingCost
     : 0;
   const totalCost = energyCost + standingCost;
-  const carbonKg =
-    heatingFuelKWh * CARBON_FACTORS.gas.perKWh +
-    coolingFuelKWh * CARBON_FACTORS.electricity.consumption;
+  const gasCarbonKg = gasUseKWh * CARBON_FACTORS.gas.perKWh;
+  const electricityCarbonKg =
+    electricityUseKWh * CARBON_FACTORS.electricity.consumption;
+  const carbonKg = gasCarbonKg + electricityCarbonKg;
   return {
     heatingThermalKWh: safeHeating,
     coolingThermalKWh: safeCooling,
-    heatingFuelKWh,
-    coolingFuelKWh,
+    heatingFuelKWh: gasUseKWh,
+    coolingFuelKWh: electricityUseKWh,
+    gasUseKWh,
+    electricityUseKWh,
+    gasEnergyCost,
+    electricityEnergyCost,
     energyCost,
+    gasStandingCost,
+    electricityStandingCost,
     standingCost,
     totalCost,
+    gasCarbonKg,
+    electricityCarbonKg,
     carbonKg,
   };
 }

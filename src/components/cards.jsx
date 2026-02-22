@@ -407,6 +407,31 @@ export function EnvelopeAssumptionsCard({ uValues, presetLabel, presetDetail }) 
 
 export function CostCarbonCard({ title, periodLabel, summary }) {
   if (!summary) return null;
+  const gasUseKWh = Number.isFinite(summary.gasUseKWh)
+    ? summary.gasUseKWh
+    : summary.heatingFuelKWh;
+  const electricityUseKWh = Number.isFinite(summary.electricityUseKWh)
+    ? summary.electricityUseKWh
+    : summary.coolingFuelKWh;
+  const gasEnergyCost = Number.isFinite(summary.gasEnergyCost)
+    ? summary.gasEnergyCost
+    : gasUseKWh * ENERGY_TARIFFS.gas.unitRate;
+  const electricityEnergyCost = Number.isFinite(summary.electricityEnergyCost)
+    ? summary.electricityEnergyCost
+    : electricityUseKWh * ENERGY_TARIFFS.electricity.unitRate;
+  const gasStandingCost = Number.isFinite(summary.gasStandingCost)
+    ? summary.gasStandingCost
+    : summary.standingCost * 0.5;
+  const electricityStandingCost = Number.isFinite(summary.electricityStandingCost)
+    ? summary.electricityStandingCost
+    : summary.standingCost * 0.5;
+  const gasCarbonKg = Number.isFinite(summary.gasCarbonKg)
+    ? summary.gasCarbonKg
+    : gasUseKWh * CARBON_FACTORS.gas.perKWh;
+  const electricityCarbonKg = Number.isFinite(summary.electricityCarbonKg)
+    ? summary.electricityCarbonKg
+    : electricityUseKWh * CARBON_FACTORS.electricity.consumption;
+
   return (
     <Card className="space-y-3 p-5">
       <div className="flex items-center justify-between">
@@ -418,32 +443,34 @@ export function CostCarbonCard({ title, periodLabel, summary }) {
       </p>
       <div className="grid grid-cols-2 gap-2 text-xs text-slate-600">
         <div className="rounded-md bg-slate-50 p-2">
-          <p className="font-medium text-slate-700">Heating fuel</p>
-          <p>{summary.heatingFuelKWh.toFixed(1)} kWh</p>
+          <p className="font-medium text-slate-700">Gas use (heating)</p>
+          <p>{gasUseKWh.toFixed(1)} kWh</p>
         </div>
         <div className="rounded-md bg-slate-50 p-2">
-          <p className="font-medium text-slate-700">Cooling electricity</p>
-          <p>{summary.coolingFuelKWh.toFixed(1)} kWh</p>
+          <p className="font-medium text-slate-700">Electricity use (cooling)</p>
+          <p>{electricityUseKWh.toFixed(1)} kWh</p>
         </div>
         <div className="rounded-md bg-slate-50 p-2">
-          <p className="font-medium text-slate-700">Energy cost</p>
-          <p>{formatGBP(summary.energyCost)}</p>
+          <p className="font-medium text-slate-700">Gas spend</p>
+          <p>{formatGBP(gasEnergyCost + gasStandingCost)}</p>
         </div>
         <div className="rounded-md bg-slate-50 p-2">
-          <p className="font-medium text-slate-700">Standing charges</p>
-          <p>{formatGBP(summary.standingCost)}</p>
+          <p className="font-medium text-slate-700">Electricity spend</p>
+          <p>{formatGBP(electricityEnergyCost + electricityStandingCost)}</p>
         </div>
       </div>
       <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
-        <span className="text-xs">Total cost</span>
-        <span>
-          <span className="text-lg font-bold">{formatGBP(summary.energyCost)}</span>
-          <span className="text-[10px] text-slate-500"> (+{formatGBP(summary.standingCost)})</span>
-        </span>
+        <span className="text-xs">Total spend (all-in)</span>
+        <span className="text-lg font-bold">{formatGBP(summary.totalCost)}</span>
       </div>
       <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
         <span className="text-xs">Carbon emissions</span>
-        <span className="text-lg font-bold">{formatKg(summary.carbonKg)}</span>
+        <span className="text-right">
+          <span className="block text-lg font-bold">{formatKg(summary.carbonKg)}</span>
+          <span className="text-[10px] text-slate-500">
+            Gas {formatKg(gasCarbonKg)} · Elec {formatKg(electricityCarbonKg)}
+          </span>
+        </span>
       </div>
     </Card>
   );
