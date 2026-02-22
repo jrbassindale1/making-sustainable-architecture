@@ -173,11 +173,11 @@ export default function App() {
     openHeight: 0,
   });
   const [rooflightEnabled, setRooflightEnabled] = useState(true);
-  const [downlightIntensity, setDownlightIntensity] = useState(DOWNLIGHT_INTENSITY_DEFAULT);
-  const [downlightBeamAngle, setDownlightBeamAngle] = useState(DOWNLIGHT_BEAM_ANGLE_DEFAULT);
-  const [downlightPenumbra, setDownlightPenumbra] = useState(DOWNLIGHT_PENUMBRA_DEFAULT);
-  const [downlightThrowScale, setDownlightThrowScale] = useState(DOWNLIGHT_THROW_SCALE_DEFAULT);
-  const [downlightSourceGlow, setDownlightSourceGlow] = useState(DOWNLIGHT_SOURCE_GLOW_DEFAULT);
+  const downlightIntensity = DOWNLIGHT_INTENSITY_DEFAULT;
+  const downlightBeamAngle = DOWNLIGHT_BEAM_ANGLE_DEFAULT;
+  const downlightPenumbra = DOWNLIGHT_PENUMBRA_DEFAULT;
+  const downlightThrowScale = DOWNLIGHT_THROW_SCALE_DEFAULT;
+  const downlightSourceGlow = DOWNLIGHT_SOURCE_GLOW_DEFAULT;
   const [viewMode, setViewMode] = useState("explore");
   const [exploreTab, setExploreTab] = useState("context");
   const [ventilationPreset, setVentilationPreset] = useState(DEFAULT_VENTILATION_PRESET);
@@ -2555,63 +2555,6 @@ export default function App() {
                           <div className="rounded-md bg-slate-50 p-2 text-xs text-slate-600">
                             Floor area {buildingFloorArea.toFixed(2)} m² · Volume {buildingVolume.toFixed(2)} m³
                           </div>
-                        </div>
-                        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-3">
-                          <p className="text-sm font-medium text-slate-800">Ceiling downlights (automatic)</p>
-                          <SliderField
-                            label="Brightness"
-                            value={downlightIntensity}
-                            onChange={setDownlightIntensity}
-                            min={8}
-                            max={120}
-                            step={1}
-                            formatValue={(v) => `${Math.round(v)}`}
-                          />
-                          <SliderField
-                            label="Source glow"
-                            value={downlightSourceGlow}
-                            onChange={setDownlightSourceGlow}
-                            min={0}
-                            max={4}
-                            step={0.05}
-                            formatValue={(v) => `${v.toFixed(2)}x`}
-                          />
-                          <SliderField
-                            label="Beam spread"
-                            value={downlightBeamAngle}
-                            onChange={setDownlightBeamAngle}
-                            min={0.25}
-                            max={0.95}
-                            step={0.01}
-                            formatValue={(v) => `${Math.round((v / 0.95) * 100)}%`}
-                          />
-                          <SliderField
-                            label="Edge softness"
-                            value={downlightPenumbra}
-                            onChange={setDownlightPenumbra}
-                            min={0.05}
-                            max={1}
-                            step={0.01}
-                            formatValue={(v) => `${Math.round(v * 100)}%`}
-                          />
-                          <SliderField
-                            label="Throw distance"
-                            value={downlightThrowScale}
-                            onChange={setDownlightThrowScale}
-                            min={1}
-                            max={4}
-                            step={0.05}
-                            formatValue={(v) => `${v.toFixed(2)}x room height`}
-                          />
-                          <p className="text-xs text-slate-500">
-                            Auto mode: on when desk daylight is below {LUX_THRESHOLDS.adequate} lux, from 1 hour
-                            before sunrise until {String(DOWNLIGHTS_OFF_HOUR).padStart(2, "0")}:00.
-                          </p>
-                          <p className="text-xs text-slate-600">
-                            Status now:{" "}
-                            <span className="font-semibold">{downlightsOn ? "On" : "Off"}</span> · Desk light{" "}
-                            {Math.round(snapshot.illuminanceLux ?? 0)} lux.
-                          </p>
                         </div>
                         <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
                           <div className="flex items-center justify-between gap-3">
