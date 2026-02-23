@@ -71,7 +71,7 @@ const LOW_POWER_TARGET_FPS = 12;
 const AUTO_LOW_FPS_THRESHOLD = 20;
 const AUTO_RECOVER_FPS_THRESHOLD = 24;
 const AUTO_FPS_SAMPLE_SECONDS = 2.5;
-const WINDOW_MEMBER_CAST_SHADOW = false;
+const WINDOW_MEMBER_CAST_SHADOW = true;
 
 function configureTexture(texture, repeat, useSrgb = false) {
   if (!texture) return;
