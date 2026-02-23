@@ -405,7 +405,7 @@ export function EnvelopeAssumptionsCard({ uValues, presetLabel, presetDetail }) 
   );
 }
 
-export function CostCarbonCard({ title, periodLabel, summary }) {
+export function CostCarbonCard({ title, periodLabel, summary, isAnnual = false }) {
   if (!summary) return null;
   const gasUseKWh = Number.isFinite(summary.gasUseKWh)
     ? summary.gasUseKWh
@@ -452,19 +452,27 @@ export function CostCarbonCard({ title, periodLabel, summary }) {
         </div>
         <div className="rounded-md bg-slate-50 p-2">
           <p className="font-medium text-slate-700">Gas spend</p>
-          <p>{formatGBP(gasEnergyCost + gasStandingCost)}</p>
+          <p>{formatGBP(gasEnergyCost)}</p>
+          <p className="text-[10px] text-slate-500">+ standing {formatGBP(gasStandingCost)}</p>
         </div>
         <div className="rounded-md bg-slate-50 p-2">
           <p className="font-medium text-slate-700">Electricity spend</p>
-          <p>{formatGBP(electricityEnergyCost + electricityStandingCost)}</p>
+          <p>{formatGBP(electricityEnergyCost)}</p>
+          <p className="text-[10px] text-slate-500">+ standing {formatGBP(electricityStandingCost)}</p>
         </div>
       </div>
       <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
         <span className="text-xs">Total spend (all-in)</span>
-        <span className="text-lg font-bold">{formatGBP(summary.totalCost)}</span>
+        <span className="text-right">
+          <span className="block text-lg font-bold">{formatGBP(summary.totalCost)}</span>
+          <span className="text-[10px] text-slate-500">includes {formatGBP(summary.standingCost)} standing charges</span>
+        </span>
       </div>
       <div className="flex items-center justify-between rounded-md bg-slate-100 px-3 py-2 text-slate-700">
-        <span className="text-xs">Carbon emissions</span>
+        <span className="text-xs">
+          Carbon emissions
+          {isAnnual ? " (per year)" : ""}
+        </span>
         <span className="text-right">
           <span className="block text-lg font-bold">{formatKg(summary.carbonKg)}</span>
           <span className="text-[10px] text-slate-500">

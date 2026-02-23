@@ -504,7 +504,7 @@ export default function App() {
   const applyPassivhausOverride = useCallback(() => {
     setUValuePreset(PASSIVHAUS_U_VALUE_PRESET);
     setVentilationPreset(PASSIVHAUS_VENTILATION_PRESET);
-    setNightPurgeEnabled(false);
+    setNightPurgeEnabled(true);
     setFaceState({
       north: { ...PASSIVHAUS_FACE_STATE.north },
       east: { ...PASSIVHAUS_FACE_STATE.east },
@@ -2244,6 +2244,7 @@ export default function App() {
                   title="Annual cost + carbon"
                   periodLabel="Full year (8,760 h)"
                   summary={annualCostSummary}
+                  isAnnual
                 />
 
                 <Card className="space-y-4 p-5">
@@ -2953,7 +2954,7 @@ export default function App() {
                               <span className="font-medium text-slate-700">{passivhausVentPreset?.label ?? "MVHR"}</span>{" "}
                               at {passivhausVentPreset?.achTotal?.toFixed?.(1) ?? "n/a"} ACH.
                             </li>
-                            <li>Night purge off by default (enable seasonally when night cooling is beneficial).</li>
+                            <li>Smart night purge on by default (only boosts when indoor is above comfort and outdoor air is cooler).</li>
                             <li>
                               Facade defaults: smaller N/E/W glazing, larger south glazing, plus south overhang and
                               E/W fins to temper summer solar gains.
