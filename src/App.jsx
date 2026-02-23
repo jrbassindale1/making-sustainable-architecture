@@ -328,10 +328,13 @@ export default function App() {
 
     const updateSize = () => {
       const rect = node.getBoundingClientRect();
-      setDailyChartSize({
+      const next = {
         width: Math.max(0, Math.floor(rect.width)),
         height: Math.max(0, Math.floor(rect.height)),
-      });
+      };
+      setDailyChartSize((prev) =>
+        prev.width === next.width && prev.height === next.height ? prev : next,
+      );
     };
 
     updateSize();
@@ -1545,6 +1548,11 @@ export default function App() {
     () => Array.from({ length: 13 }, (_, idx) => idx * 2),
     [],
   );
+  const selectedHourForChart = useMemo(() => {
+    if (!Number.isFinite(selectedHour)) return null;
+    const wrapped = ((Math.floor(selectedHour) % 24) + 24) % 24;
+    return Math.max(0, Math.min(23, wrapped));
+  }, [selectedHour]);
 
   const dayEnergyBreakdown = useMemo(() => {
     if (daySeries.length <= 1) return null;
@@ -1951,10 +1959,10 @@ export default function App() {
                             data={chartData}
                           >
                             <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                            {Number.isFinite(selectedHour) && (
+                            {selectedHourForChart !== null && (
                               <ReferenceArea
-                                x1={selectedHour}
-                                x2={selectedHour + 1}
+                                x1={selectedHourForChart}
+                                x2={selectedHourForChart + 1}
                                 strokeOpacity={0}
                                 fill="rgba(15, 23, 42, 0.08)"
                               />
@@ -1997,7 +2005,7 @@ export default function App() {
                             <Line
                               dataKey="roomTemperature"
                               dot={false}
-                              isAnimationActive={!exportingPngs}
+                              isAnimationActive={false}
                               strokeWidth={2}
                               stroke="#0f766e"
                               name="Room temperature"
@@ -2005,7 +2013,7 @@ export default function App() {
                             <Line
                               dataKey="outdoorTemperature"
                               dot={false}
-                              isAnimationActive={!exportingPngs}
+                              isAnimationActive={false}
                               strokeWidth={2}
                               strokeDasharray="6 4"
                               stroke="#2563eb"
@@ -2015,7 +2023,7 @@ export default function App() {
                               yAxisId="solar"
                               dataKey="solarGain"
                               dot={false}
-                              isAnimationActive={!exportingPngs}
+                              isAnimationActive={false}
                               strokeWidth={2}
                               stroke="#f59e0b"
                               name="Solar gains"
@@ -2024,7 +2032,7 @@ export default function App() {
                               yAxisId="vent"
                               dataKey="ventAch"
                               dot={false}
-                              isAnimationActive={!exportingPngs}
+                              isAnimationActive={false}
                               strokeWidth={2}
                               strokeDasharray="3 3"
                               stroke="#7c3aed"
@@ -2034,7 +2042,7 @@ export default function App() {
                               yAxisId="heatLoss"
                               dataKey="heatLoss"
                               dot={false}
-                              isAnimationActive={!exportingPngs}
+                              isAnimationActive={false}
                               strokeWidth={2}
                               stroke="#e11d48"
                               name="Heat loss"
