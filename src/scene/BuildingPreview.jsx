@@ -3153,19 +3153,85 @@ function SunOrb({ position, opacity }) {
 }
 
 function ScenePostProcessing({ sunFactor }) {
+  const { gl } = useThree();
+  const [contextLost, setContextLost] = useState(false);
+
+  useEffect(() => {
+    const canvas = gl?.domElement;
+    if (!canvas) return;
+
+    const handleContextLost = (event) => {
+      event.preventDefault();
+      setContextLost(true);
+    };
+    const handleContextRestored = () => {
+      setContextLost(false);
+    };
+
+    canvas.addEventListener("webglcontextlost", handleContextLost, false);
+    canvas.addEventListener("webglcontextrestored", handleContextRestored, false);
+    return () => {
+      canvas.removeEventListener("webglcontextlost", handleContextLost, false);
+      canvas.removeEventListener("webglcontextrestored", handleContextRestored, false);
+    };
+  }, [gl]);
+
+  const postFxProfile = useMemo(() => {
+    if (contextLost) {
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
+
+    const context = gl?.getContext?.();
+    if (!context) {
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
+
+    const isContextLost = typeof context.isContextLost === "function" && context.isContextLost();
+    if (isContextLost) {
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
+
+    const isWebGL2 = gl.capabilities?.isWebGL2 === true;
+    if (!isWebGL2) {
+      // Postprocessing shader programs are unstable on some WebGL1 drivers.
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
+
+    const hasColorBufferFloat =
+      Boolean(context.getExtension("EXT_color_buffer_float")) ||
+      Boolean(context.getExtension("WEBGL_color_buffer_float"));
+    if (!hasColorBufferFloat) {
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
+
+    return {
+      enabled: true,
+      useSsao: true,
+      useBloomMipmap: true,
+      multisampling: 4,
+    };
+  }, [contextLost, gl]);
+
+  if (!postFxProfile.enabled) return null;
+
   return (
-    <EffectComposer multisampling={4} enableNormalPass>
-      <SSAO
-        blendFunction={BlendFunction.MULTIPLY}
-        samples={14}
-        radius={0.085}
-        intensity={15}
-        luminanceInfluence={0.25}
-        color="black"
-      />
+    <EffectComposer
+      multisampling={postFxProfile.multisampling}
+      enableNormalPass={postFxProfile.useSsao}
+    >
+      {postFxProfile.useSsao && (
+        <SSAO
+          blendFunction={BlendFunction.MULTIPLY}
+          samples={14}
+          radius={0.085}
+          intensity={15}
+          luminanceInfluence={0.25}
+          color="black"
+        />
+      )}
       <Bloom
         blendFunction={BlendFunction.SCREEN}
-        mipmapBlur
+        mipmapBlur={postFxProfile.useBloomMipmap}
         luminanceThreshold={0.82}
         luminanceSmoothing={0.2}
         intensity={0.14 + sunFactor * 0.3}
