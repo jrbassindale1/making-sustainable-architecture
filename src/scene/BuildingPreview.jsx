@@ -3185,6 +3185,11 @@ function ScenePostProcessing({ sunFactor }) {
     if (!context) {
       return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
     }
+    const contextAttributes =
+      context.getContextAttributes?.() ?? gl?.getContextAttributes?.();
+    if (!contextAttributes || typeof contextAttributes.alpha !== "boolean") {
+      return { enabled: false, useSsao: false, useBloomMipmap: false, multisampling: 0 };
+    }
 
     const isContextLost = typeof context.isContextLost === "function" && context.isContextLost();
     if (isContextLost) {
@@ -3445,6 +3450,7 @@ export function BuildingPreview({
     stretch ? "flex-1 min-h-[200px]" : isCompact ? "h-64 md:h-72" : "h-80",
     canvasClassName
   );
+  const preserveDrawingBuffer = captureMode;
 
   return (
     <Card className={cardClass}>
@@ -3458,7 +3464,7 @@ export function BuildingPreview({
           dpr={effectiveLowPerformance ? [0.75, 1] : [1, 1.5]}
           camera={{ position: cameraPosition, fov: 45, near: 0.1, far: 60 }}
           frameloop={effectiveLowPerformance ? "demand" : "always"}
-          gl={{ preserveDrawingBuffer: true }}
+          gl={{ preserveDrawingBuffer }}
           className="building-preview-canvas"
         >
           <LowFpsTicker enabled={effectiveLowPerformance} />
@@ -3534,7 +3540,7 @@ export function BuildingPreview({
             maxPolarAngle={Math.PI / 1.85}
             target={[0, height / 2, 0]}
           />
-          {!effectiveLowPerformance && <ScenePostProcessing sunFactor={sunFactor} />}
+          {!effectiveLowPerformance && !captureMode && <ScenePostProcessing sunFactor={sunFactor} />}
         </Canvas>
         {showCanvasLoader && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-slate-100/70 backdrop-blur-[1px]">
