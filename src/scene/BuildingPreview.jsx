@@ -3225,12 +3225,12 @@ export function BuildingPreview({
           <hemisphereLight intensity={hemisphereIntensity} groundColor={hemisphereGround} />
           <directionalLight
             ref={lightRef}
-            castShadow={!effectiveLowPerformance && sunFactor > 0.02}
+            castShadow={sunFactor > 0.02}
             position={lightPosition}
             intensity={sunIntensity}
             color="#ffdf91"
-            shadow-mapSize-width={1024}
-            shadow-mapSize-height={1024}
+            shadow-mapSize-width={effectiveLowPerformance ? 512 : 1024}
+            shadow-mapSize-height={effectiveLowPerformance ? 512 : 1024}
             shadow-camera-near={0.1}
             shadow-camera-far={30}
             shadow-camera-left={-12}
