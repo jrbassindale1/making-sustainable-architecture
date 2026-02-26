@@ -14,20 +14,20 @@ export function Compass({ northLineStartRadius = 0.3 }) {
 
   const cardinals = [
     { label: "N", angle: 180 },
-    { label: "E", angle: 90 },
+    { label: "W", angle: 90 },
     { label: "S", angle: 0 },
-    { label: "W", angle: 270 },
+    { label: "E", angle: 270 },
   ];
 
   const intercardinals = [
-    { label: "NE", angle: 135 },
-    { label: "SE", angle: 45 },
-    { label: "SW", angle: 315 },
-    { label: "NW", angle: 225 },
+    { label: "NW", angle: 135 },
+    { label: "SW", angle: 45 },
+    { label: "SE", angle: 315 },
+    { label: "NE", angle: 225 },
   ];
 
   return (
-    <group position={[0, 0.02, 0]} rotation={[-Math.PI / 2, Math.PI, 0]}>
+    <group position={[0, 0.02, 0]} rotation={[-Math.PI / 2, 0, 0]}>
       {/* Outer ring */}
       <Ring args={[outerRadius - ringThickness, outerRadius, 64]}>
         <meshBasicMaterial color={compassColor} />
