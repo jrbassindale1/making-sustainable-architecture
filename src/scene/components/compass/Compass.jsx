@@ -14,16 +14,16 @@ export function Compass({ northLineStartRadius = 0.3 }) {
 
   const cardinals = [
     { label: "N", angle: 180 },
-    { label: "W", angle: 90 },
+    { label: "E", angle: 90 },
     { label: "S", angle: 0 },
-    { label: "E", angle: 270 },
+    { label: "W", angle: 270 },
   ];
 
   const intercardinals = [
-    { label: "NW", angle: 135 },
-    { label: "SW", angle: 45 },
-    { label: "SE", angle: 315 },
-    { label: "NE", angle: 225 },
+    { label: "NE", angle: 135 },
+    { label: "SE", angle: 45 },
+    { label: "SW", angle: 315 },
+    { label: "NW", angle: 225 },
   ];
 
   return (
@@ -42,6 +42,7 @@ export function Compass({ northLineStartRadius = 0.3 }) {
         const tickEndY = Math.sin(rad) * (tickStartRadius + tickLength);
         const labelX = Math.cos(rad) * labelOffset;
         const labelY = Math.sin(rad) * labelOffset;
+        const showLabel = label === "N" || label === "S";
 
         return (
           <group key={label}>
@@ -58,12 +59,14 @@ export function Compass({ northLineStartRadius = 0.3 }) {
               <lineBasicMaterial color={compassColor} linewidth={2} />
             </line>
             {/* Label */}
-            <CompassFloorLabel
-              label={label}
-              color={compassColor}
-              position={[labelX, labelY, 0.01]}
-              size={0.82}
-            />
+            {showLabel && (
+              <CompassFloorLabel
+                label={label}
+                color={compassColor}
+                position={[labelX, labelY, 0.01]}
+                size={0.82}
+              />
+            )}
           </group>
         );
       })}

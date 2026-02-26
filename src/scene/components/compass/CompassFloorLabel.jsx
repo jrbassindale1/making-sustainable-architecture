@@ -26,7 +26,7 @@ export function CompassFloorLabel({ label, color, position, size = 0.82 }) {
   if (!texture) return null;
 
   return (
-    <mesh position={position} renderOrder={3}>
+    <mesh position={position} rotation={[0, Math.PI, 0]} renderOrder={3}>
       <planeGeometry args={[size, size]} />
       <meshBasicMaterial
         map={texture}
